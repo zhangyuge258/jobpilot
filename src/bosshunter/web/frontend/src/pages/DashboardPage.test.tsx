@@ -1,0 +1,749 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import DashboardPage from './DashboardPage'
+import type { WorkbenchTask } from '@/hooks/useDashboard'
+
+let workbenchPayload: Record<string, unknown> = {}
+let stopResponse: () => Response = () => jsonResponse({})
+let preflightResponse: () => Response = () => jsonResponse({})
+
+function jsonResponse(body: unknown, ok = true) {
+  return new Response(JSON.stringify(body), {
+    status: ok ? 200 : 500,
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+function buildTask(overrides: Partial<WorkbenchTask>): WorkbenchTask {
+  return {
+    id: 'task-1',
+    mode: 'greet',
+    label: '生成招呼语',
+    status: 'running',
+    logs: [],
+    stop_requested: false,
+    ...overrides,
+  }
+}
+
+function baseWorkbench(overrides: Record<string, unknown> = {}) {
+  return {
+    funnel: {},
+    funnel_today: {},
+    pending_confirmation: [],
+    pending_greetings: [],
+    send_errors: [],
+    needs_resume: [],
+    send_quota: { daily_limit: 30, sent: 0, remaining: 30, exhausted: false },
+    task: null,
+    last_task: null,
+    ...overrides,
+  }
+}
+
+const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  const url = String(input)
+  if (url === '/api/workbench' && (!init?.method || init.method === 'GET')) {
+    return jsonResponse(workbenchPayload)
+  }
+  if (url.includes('/stop') && init?.method === 'POST') {
+    return stopResponse()
+  }
+  if (url.startsWith('/api/workbench/preflight')) {
+    return preflightResponse()
+  }
+  return jsonResponse({})
+})
+
+describe('DashboardPage workbench task panel', () => {
+  it('keeps collection and AI controls independent and stops only the chosen task', async () => {
+    const collect = buildTask({ id: 'collect-boss', mode: 'collect', label: '单独采集', platforms: ['boss'], resources: ['collect:boss'] })
+    const score = buildTask({ id: 'score-zhilian', mode: 'score', label: '单独 AI 评分', metrics: { ai_total: 8, ai_completed: 3 } })
+    const finished = buildTask({ id: 'old-done', mode: 'greet', status: 'completed', label: '已结束的招呼任务' })
+    workbenchPayload = baseWorkbench({ task: collect, tasks: [collect, score, finished], active_tasks: [collect, score] })
+    stopResponse = () => jsonResponse({ ...score, status: 'stopping' })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<DashboardPage view="workbench" />)
+    const tasks = await screen.findByRole('region', { name: '独立运行任务' })
+    const cards = within(tasks).getAllByRole('article')
+    expect(cards.length).toBe(2)
+    fireEvent.click(within(cards[1]).getByRole('button', { name: /单独 AI 评分/ }))
+    expect(await screen.findByRole('progressbar', { name: 'AI 评分进度' })).toBeTruthy()
+    fireEvent.click(within(cards[1]).getByRole('button', { name: '停止此任务' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/workbench/task/score-zhilian/stop')).toBe(true))
+    expect(fetchMock.mock.calls.some(([url]) => String(url) === '/api/workbench/task/collect-boss/stop')).toBe(false)
+    fireEvent.change(screen.getByLabelText('查看任务进度'), { target: { value: 'old-done' } })
+    expect(screen.queryByRole('button', { name: '停止任务' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /^单独采集/ }))
+    expect(await screen.findByRole('dialog')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '重新采集' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('shows scoring progress for standalone scoring even before the first job completes', async () => {
+    workbenchPayload = baseWorkbench({ task: buildTask({ mode: 'score', metrics: { ai_completed: 0, ai_total: 12 } }) })
+    render(<DashboardPage view="workbench" />)
+    expect((await screen.findByRole('progressbar', { name: 'AI 评分进度' })).getAttribute('aria-valuenow')).toBe('0')
+    expect(screen.getByText('已处理 0 / 12 · 0%')).toBeTruthy()
+  })
+
+  it('groups all collection counters with separate parsing and saving failure records', async () => {
+    workbenchPayload = baseWorkbench({ task: buildTask({ mode: 'full',
+      metrics: { collect_seen: 8, collect_new: 2, collect_parse_failed: 1, collect_save_failed: 1 },
+      progress: { outcome: 'running', platforms: { boss: {
+        status: 'running', new: 2, target: null, seen: 8, duplicate: 2, filtered: 2, parse_failed: 1, save_failed: 1,
+        message: '保存岗位失败：RuntimeError', error_records: [
+          { kind: 'parse', title: '', company: '', city: '深圳', keyword: 'AI', page: 2, reason: '列表缺少有效链接' },
+          { kind: 'save', title: '测试岗位', company: '测试公司', city: '深圳', keyword: 'AI', page: 2, reason: '保存岗位失败：RuntimeError' },
+        ],
+      } } },
+    }) })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByText('采集详情'))
+    expect(within(screen.getByLabelText('任务状态摘要')).queryByText(/本轮扫描|本轮新增|保存失败/)).toBeNull()
+    expect(screen.getByText('扫描 8 · 新增 2 · 重复 2 · 过滤 2 · 解析失败 1 · 保存失败 1')).toBeTruthy()
+    const records = screen.getByRole('list', { name: 'BOSS 直聘采集异常记录' })
+    expect(records.classList.contains('max-h-60')).toBe(true)
+    expect(within(records).getByText('解析失败')).toBeTruthy()
+    expect(within(records).getByText('保存失败')).toBeTruthy()
+    expect(within(records).getByText('测试岗位 · 测试公司')).toBeTruthy()
+    expect(within(records).getAllByText('深圳 · AI · 第 2 页')).toHaveLength(2)
+    expect(screen.getAllByText('保存岗位失败：RuntimeError')).toHaveLength(1)
+  })
+
+  it('keeps scoring details and a collection warning that differs from filtering records', async () => {
+    workbenchPayload = baseWorkbench({ task: buildTask({ mode: 'full',
+      metrics: { ai_completed: 2, ai_total: 3, ai_passed: 1, ai_filtered: 1 },
+      progress: { outcome: 'scoring', platforms: { boss: {
+        status: 'completed_with_shortage', new: 3, target: null, filtered: 1,
+        message: '翻页未生效，已停止采集',
+        filter_records: [{ title: '岗位', company: '公司', source_job_id: '1', reason: '薪资低于要求' }],
+      } } },
+    }) })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByText('任务详情'))
+    const metrics = screen.getByLabelText('任务详细统计')
+    expect(within(metrics).getByText('AI已完成')).toBeTruthy()
+    expect(within(metrics).getByText('AI总数')).toBeTruthy()
+    expect(within(metrics).getByText('AI过滤')).toBeTruthy()
+    expect(within(metrics).queryByText('AI通过')).toBeNull()
+    fireEvent.click(screen.getByText('采集详情'))
+    expect(screen.getByText('翻页未生效，已停止采集')).toBeTruthy()
+    expect(screen.getByText('薪资低于要求')).toBeTruthy()
+  })
+
+  it('shows bounded filtering details for a finished task without exposing job descriptions', async () => {
+    workbenchPayload = baseWorkbench({ last_task: buildTask({ mode: 'full', status: 'completed',
+      progress: { outcome: 'completed_with_shortage', platforms: { boss: {
+        status: 'completed', new: 0, target: null, filtered: 201, message: '薪资低于硬性要求: 10K < 12K',
+        filter_records: [{ title: '测试岗位', company: '测试公司', source_job_id: 'filtered-1', reason: '薪资低于硬性要求: 10K < 12K' }],
+      } } },
+    }) })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByText('采集详情'))
+    const records = screen.getByRole('list', { name: 'BOSS 直聘过滤记录' })
+    expect(records.classList.contains('max-h-60')).toBe(true)
+    expect(records.classList.contains('overflow-y-auto')).toBe(true)
+    expect(records.tabIndex).toBe(0)
+    expect(within(records).getByText('测试岗位 · 测试公司')).toBeTruthy()
+    expect(screen.getAllByText('薪资低于硬性要求: 10K < 12K')).toHaveLength(1)
+    expect(screen.getByText('已保留 1 条，其余记录未保留或来自旧版采集')).toBeTruthy()
+    expect(screen.getByText('过滤记录 · 201 条')).toBeTruthy()
+    fireEvent.click(screen.getByText('过滤记录 · 201 条'))
+    expect(records.closest('details')?.open).toBe(false)
+  })
+
+  it.each([false, true])('keeps collection statistics in their proper scope (multiple platforms: %s)', async multiple => {
+    const state = { status: 'running', new: 32, seen: 42, target: null, filtered: 9,
+      city: '深圳', keyword: 'AI', page: 3, max_pages: 6,
+      message: 'BOSS 本轮搜索已结束；本轮新增 32 条，读取 42 条，重复 0 条，过滤 9 条，解析失败 0 条，保存失败 0 条' }
+    workbenchPayload = baseWorkbench({ task: buildTask({ mode: 'full', logs: ['开始采集岗位'],
+      metrics: { collect_seen: 42, collect_new: 32, collect_filtered: 9 },
+      progress: { outcome: 'running', platforms: multiple ? { boss: state, zhilian: state } : { boss: state } },
+    }) })
+    render(<DashboardPage view="workbench" />)
+    await screen.findByLabelText('任务状态摘要')
+    expect(screen.queryByText('任务详情')).toBeNull()
+    expect(screen.queryByText('浏览器无反应时，请检查 BOSS 登录状态和 Chrome 连接。')).toBeNull()
+    const details = screen.getByText('采集详情').closest('details')!
+    expect(details.open).toBe(false)
+    expect(within(details.querySelector('summary')!).getAllByText(/新增 32 条/)).toHaveLength(multiple ? 2 : 1)
+    fireEvent.click(screen.getByText('采集详情'))
+    expect(details.open).toBe(true)
+    expect(within(details).getAllByText('BOSS 本轮搜索已结束')).toHaveLength(multiple ? 2 : 1)
+    expect(within(details).queryAllByText(/扫描 42 · 新增 32/)).toHaveLength(multiple ? 2 : 1)
+    expect(within(details).getAllByText(/过滤 9/)).toHaveLength(multiple ? 2 : 1)
+  })
+
+  beforeEach(() => {
+    workbenchPayload = baseWorkbench()
+    stopResponse = () => jsonResponse({})
+    preflightResponse = () => jsonResponse({})
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockClear()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  it('starts an interactive guide from an empty workbench and reuses preflight', async () => {
+    render(<DashboardPage view="workbench" />)
+
+    const guide = await screen.findByRole('region', { name: '开始使用' })
+    expect(within(guide).getByRole('link', { name: /连接 Chrome/ }).getAttribute('href')).toContain('QUICKSTART.md')
+    expect(within(guide).getByText(/单独采集且关闭自动评分时/)).toBeTruthy()
+    const started = vi.fn()
+    window.addEventListener('bosshunter:start-onboarding', started, { once: true })
+    fireEvent.click(within(guide).getByRole('button', { name: '开始交互引导' }))
+    expect(started).toHaveBeenCalledOnce()
+
+    fireEvent.click(within(guide).getByRole('button', { name: '检查准备情况' }))
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/workbench/preflight?mode=full'))
+  })
+
+  it('does not keep the getting started card above the workbench after jobs have been collected', async () => {
+    workbenchPayload = baseWorkbench({ funnel: { collected: 2 } })
+    render(<DashboardPage view="workbench" />)
+
+    expect(await screen.findByRole('heading', { name: '今日求职行动' })).toBeTruthy()
+    expect(screen.queryByRole('region', { name: '开始使用' })).toBeNull()
+  })
+
+  it('shows setup check failures next to the getting started steps', async () => {
+    preflightResponse = () => jsonResponse({
+      ok: false,
+      checks: [{
+        id: 'resume', title: '简历文件', status: 'error', message: '尚未配置有效简历',
+        detail: '打开“配置 → 个人信息”，上传简历。', action: 'config',
+      }],
+    })
+    render(<DashboardPage view="workbench" />)
+
+    const guide = await screen.findByRole('region', { name: '开始使用' })
+    fireEvent.click(within(guide).getByRole('button', { name: '检查准备情况' }))
+    const results = await within(guide).findByRole('region', { name: '启动检查结果' })
+    expect(within(results).getByRole('status').textContent).toContain('尚未配置有效简历')
+  })
+
+  it('shows per-job greet progress from task logs', async () => {
+    workbenchPayload = baseWorkbench({
+      task: buildTask({
+        status: 'running',
+        logs: ['开始为 3 个岗位生成招呼语', '生成招呼语 (2/3)：字节跳动｜后端工程师'],
+      }),
+    })
+    render(<DashboardPage view="workbench" />)
+    expect(within(await screen.findByLabelText('任务状态摘要')).getByText('生成招呼语 (2/3)：字节跳动｜后端工程师')).toBeTruthy()
+  })
+
+  it('keeps outsourcing evidence visible before greeting review and sending', async () => {
+    workbenchPayload = baseWorkbench({ pending_greetings: [{
+      id: 'outsourcing-preview', company: '合成供应商', title: '测试岗位', status: 'ready',
+      greeting: '原始招呼语', greeting_original: '原始招呼语', greeting_optimized: '优化招呼语',
+      greeting_selection: 'pending', greeting_style_issues: ['表达可以更简洁'],
+      outsourcing_level: 'confirmed', outsourcing_matches: ['合成供应商'],
+    }] })
+    render(<DashboardPage view="workbench" />)
+    const toggle = await screen.findByRole('button', { name: '展开招呼语：合成供应商｜测试岗位' })
+    expect(within(toggle).getByLabelText('外包；命中：合成供应商')).toBeTruthy()
+    fireEvent.click(toggle)
+    expect(screen.getByLabelText('外包；命中：合成供应商')).toBeTruthy()
+    expect(screen.getByText('表达可以更简洁')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '发送招呼语' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByRole('button', { name: '采用优化版' })).toBeTruthy()
+  })
+
+  it('shows the latest queue summary and preserves full progress in expandable details', async () => {
+    const latestProgress = '招呼语进度：2/3\n成功 1，失败 1，待处理 1'
+    workbenchPayload = baseWorkbench({
+      task: buildTask({
+        mode: 'full',
+        label: '全流程',
+        logs: ['招呼语进度：1/3', latestProgress, '正在等待下一次发送窗口'],
+      }),
+    })
+    render(<DashboardPage view="workbench" />)
+    const summary = await screen.findByLabelText('任务状态摘要')
+    expect(within(summary).getByText('招呼语进度：2/3')).toBeTruthy()
+    fireEvent.click(screen.getByText('任务详情'))
+    const progress = screen.getByText(latestProgress, { normalizer: text => text })
+    expect(progress.textContent).toBe(latestProgress)
+    expect(progress.classList.contains('whitespace-pre-line')).toBe(true)
+    expect(progress.closest('details:not([open]), [hidden], [aria-hidden="true"]')).toBeNull()
+    expect(screen.queryByText('招呼语进度：1/3')).toBeNull()
+    expect(screen.getByRole('button', { name: '停止任务' })).toBeTruthy()
+  })
+
+  it('shows the pause reason when a greet task completed with partial success', async () => {
+    workbenchPayload = baseWorkbench({
+      last_task: buildTask({
+        status: 'completed',
+        metrics: {
+          greet_generated: 3,
+          greet_preserved: 1,
+          greet_failed: 0,
+          greet_paused: 1,
+          greet_pause_reason: 'AI Token 额度或账户余额不足 (token_quota, status=402)',
+        },
+      }),
+    })
+    render(<DashboardPage view="workbench" />)
+    expect(await screen.findByText('提前暂停原因：AI 额度或账户余额不足。已生成内容已保存，剩余岗位下次运行会继续处理。')).toBeTruthy()
+    expect(screen.getByText('提前暂停')).toBeTruthy()
+  })
+
+  it('shows failure feedback and the raw error for a zero-output greet task', async () => {
+    workbenchPayload = baseWorkbench({
+      last_task: buildTask({
+        status: 'failed',
+        error: '招呼语生成已安全暂停：AI 服务触发请求或 Token 频率限制 (rate_limit, status=429)',
+      }),
+    })
+    const { container } = render(<DashboardPage view="workbench" />)
+    expect(await screen.findByText('任务运行失败')).toBeTruthy()
+    expect(container.textContent).toContain('招呼语生成已安全暂停：AI 服务触发请求或 Token 频率限制 (rate_limit, status=429)')
+  })
+
+  it('recovers the notice and surfaces the real error when stopping fails', async () => {
+    workbenchPayload = baseWorkbench({
+      task: buildTask({ mode: 'collect', label: '单独采集', status: 'running' }),
+    })
+    stopResponse = () => jsonResponse({ error: '任务已结束，无法停止' }, false)
+    const confirmSpy = vi.fn(() => true)
+    vi.stubGlobal('confirm', confirmSpy)
+    render(<DashboardPage view="workbench" />)
+    const stopButton = await screen.findByRole('button', { name: '停止任务' })
+    fireEvent.click(stopButton)
+    expect(confirmSpy).toHaveBeenCalled()
+    await waitFor(() => {
+      expect(screen.getAllByText('单独采集停止失败：任务已结束，无法停止').length).toBeGreaterThan(0)
+    })
+  })
+
+  it('confirms the stop request when the backend accepts it', async () => {
+    workbenchPayload = baseWorkbench({
+      task: buildTask({ mode: 'collect', label: '单独采集', status: 'running' }),
+    })
+    stopResponse = () => jsonResponse(buildTask({ mode: 'collect', label: '单独采集', status: 'stopping', stop_requested: true }))
+    vi.stubGlobal('confirm', () => true)
+    render(<DashboardPage view="workbench" />)
+    const stopButton = await screen.findByRole('button', { name: '停止任务' })
+    fireEvent.click(stopButton)
+    await waitFor(() => {
+      expect(screen.getAllByText('单独采集已请求停止。').length).toBeGreaterThan(0)
+    })
+  })
+  it('displays the final edited version alongside both generated candidates', async () => {
+    workbenchPayload = baseWorkbench({ pending_greetings: [{
+      id: 'final-preview', company: '测试公司', title: '测试岗位', status: 'ready',
+      greeting: '手动修改后最终发送的文字', greeting_original: 'AI 原始候选',
+      greeting_optimized: 'AI 优化候选', greeting_selection: 'edited',
+      greeting_reviewed_at: '2026-09-09 12:00:00',
+    }] })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByRole('button', { name: '展开招呼语：测试公司｜测试岗位' }))
+    const finalVersion = await screen.findByLabelText('最终发送版本')
+    expect(within(finalVersion).getByText('手动修改后最终发送的文字')).toBeTruthy()
+    expect(screen.getByText('AI 原始候选')).toBeTruthy()
+    expect(screen.getByText('AI 优化候选')).toBeTruthy()
+  })
+
+  it('blocks individual and batch sends until an edit is saved and refreshed', async () => {
+    const job = {
+      id: 'saving-preview', company: '测试公司', title: '测试岗位', status: 'ready',
+      greeting: '原始版本', greeting_original: '原始版本', greeting_optimized: '优化版本',
+      greeting_selection: 'original', greeting_reviewed_at: '2026-09-09 12:00:00',
+    }
+    workbenchPayload = baseWorkbench({ pending_greetings: [job] })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByRole('button', { name: '展开招呼语：测试公司｜测试岗位' }))
+    fireEvent.click(await screen.findByRole('button', { name: '手动编辑' }))
+    const send = screen.getByRole('button', { name: '发送招呼语' }) as HTMLButtonElement
+    const batchSend = screen.getByRole('button', { name: '发送已确认 1 个' }) as HTMLButtonElement
+    expect(send.disabled).toBe(true)
+    expect(batchSend.disabled).toBe(true)
+    fireEvent.change(screen.getByLabelText('手动编辑最终版本'), { target: { value: '保存后真正发送的文字' } })
+    let finishSave!: (response: Response) => void
+    fetchMock.mockImplementationOnce(() => new Promise<Response>(resolve => { finishSave = resolve }))
+    fireEvent.click(screen.getByRole('button', { name: '保存编辑版' }))
+    expect(send.disabled).toBe(true)
+    expect(batchSend.disabled).toBe(true)
+    const saved = { ...job, greeting: '保存后真正发送的文字', greeting_selection: 'edited' }
+    workbenchPayload = baseWorkbench({ pending_greetings: [saved] })
+    finishSave(jsonResponse(saved))
+    await waitFor(() => expect(send.disabled).toBe(false))
+    expect(batchSend.disabled).toBe(false)
+    expect(within(screen.getByLabelText('最终发送版本')).getByText(saved.greeting)).toBeTruthy()
+  })
+
+  it('keeps candidates collapsed and prevents sending before a version is chosen', async () => {
+    workbenchPayload = baseWorkbench({ pending_greetings: [{
+      id: 'pending-preview', company: '测试公司', title: '测试岗位', status: 'ready',
+      greeting: '待确认原文', greeting_original: '待确认原文',
+      greeting_optimized: '优化候选', greeting_selection: 'pending',
+    }] })
+    render(<DashboardPage view="workbench" />)
+    const toggle = await screen.findByRole('button', { name: '展开招呼语：测试公司｜测试岗位' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText('优化候选')).toBeNull()
+    expect(screen.queryByRole('button', { name: '发送招呼语' })).toBeNull()
+    expect((screen.getByRole('button', { name: '发送已确认 0 个' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(toggle)
+    expect(screen.getByText('优化候选')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '发送招呼语' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByRole('button', { name: '保留原文' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '收起招呼语：测试公司｜测试岗位' }))
+    expect(screen.queryByText('优化候选')).toBeNull()
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0)
+  })
+
+  it.each(['full', 'monitor', 'greet', 'deliver'] as const)('allows version selection during an unrelated %s task without stopping or sending', async (mode) => {
+    const job = {
+      id: 'editable-preview', company: '测试公司', title: '测试岗位', status: 'ready',
+      greeting: '待确认原文', greeting_original: '待确认原文',
+      greeting_optimized: '优化候选', greeting_selection: 'pending',
+    }
+    workbenchPayload = baseWorkbench({ task: buildTask({ mode }), pending_greetings: [job] })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByRole('button', { name: '展开招呼语：测试公司｜测试岗位' }))
+    expect((screen.getByRole('button', { name: '保留原文' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: '手动编辑' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: '发送招呼语' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: '采用优化版' }))
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST').length).toBe(1))
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === 'POST')
+    expect(String(posts[0][0])).toBe('/api/jobs/editable-preview/greeting-selection')
+    expect(JSON.parse(String(posts[0][1]?.body))).toEqual({ selection: 'optimized', greeting: '', confirmed: true })
+    expect(screen.queryByRole('button', { name: '停止任务后选择' })).toBeNull()
+  })
+
+  it.each(['sending', 'generating'] as const)('locks only the greeting currently %s and explains why', async (activity) => {
+    const job = {
+      id: 'busy-preview', company: '当前公司', title: '测试岗位', status: 'ready',
+      greeting: '原文', greeting_original: '原文', greeting_optimized: '候选', greeting_selection: 'pending',
+    }
+    workbenchPayload = baseWorkbench({ task: buildTask({ mode: 'full' }), pending_greetings: [
+      { ...job, greeting_activity: activity }, { ...job, id: 'free-preview', company: '其他公司' },
+    ] })
+    render(<DashboardPage view="workbench" />)
+    fireEvent.click(await screen.findByRole('button', { name: '展开招呼语：当前公司｜测试岗位' }))
+    expect((screen.getByRole('button', { name: '保留原文' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText(activity === 'sending' ? '这条正在发送，暂不可修改。' : '这条正在生成，完成后即可选择。')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '收起招呼语：当前公司｜测试岗位' }))
+    fireEvent.click(screen.getByRole('button', { name: '展开招呼语：其他公司｜测试岗位' }))
+    expect((screen.getByRole('button', { name: '保留原文' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((screen.getByRole('button', { name: '手动编辑' }) as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('summarizes collection limits while keeping full diagnostics in closed details', async () => {
+    workbenchPayload = baseWorkbench({ task: buildTask({
+      mode: 'full', metrics: { collect_seen: 327, collect_new: 150, collect_parse_failed: 0, collect_save_failed: 2 },
+      progress: { outcome: 'completed_with_shortage', platforms: { boss: {
+        status: 'completed', new: 150, target: null, seen: 327,
+        reason_code: 'safety_limit', message: 'BOSS 采集已达安全上限：daily_detail_page_limit；读取 327 条',
+      } } },
+    }) })
+    render(<DashboardPage view="workbench" />)
+    const reason = await screen.findByText('今日详情页次数已用完')
+    expect(reason.closest('details')?.open).toBe(false)
+    expect(screen.getByText('采集已结束，数量不足')).toBeTruthy()
+    expect(screen.queryByText('completed_with_shortage')).toBeNull()
+    const metrics = screen.getByLabelText('任务关键统计')
+    expect(within(metrics).queryByText('保存失败 2')).toBeNull()
+    expect(within(metrics).queryByText('解析失败')).toBeNull()
+    expect(screen.queryByText('任务详情')).toBeNull()
+  })
+
+})
+
+describe('DashboardPage scoring dialog confirm behaviour', () => {
+  const scoringPreview = {
+    eligible_jobs: 3,
+    skipped_jobs: 0,
+    first_attempt_requests: 3,
+    max_attempts_per_job: 2,
+    max_possible_requests: 6,
+    note: '',
+  }
+
+  function stubDashboardFetch(overrides: Record<string, () => Response | undefined> = {}) {
+    const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const override = overrides[url]
+      if (override) {
+        const response = override()
+        if (response) return response
+      }
+      if (url === '/api/workbench' && (!init?.method || init.method === 'GET')) return jsonResponse(workbenchPayload)
+      if (url.startsWith('/api/jobs/search')) return jsonResponse({ items: [], total: 0, all_total: 0 })
+      if (url === '/api/scoring/preview' && init?.method === 'POST') return jsonResponse(scoringPreview)
+      if (url === '/api/scoring/runs') return jsonResponse([])
+      if (url === '/api/scoring/start' && init?.method === 'POST') {
+        return jsonResponse({ run: { remaining_job_ids: ['j1', 'j2', 'j3'] } })
+      }
+      return jsonResponse({})
+    })
+    vi.stubGlobal('fetch', fn)
+    return fn
+  }
+
+  beforeEach(() => {
+    workbenchPayload = baseWorkbench()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  async function openScoringDialog() {
+    render(<DashboardPage view="jobs" />)
+    fireEvent.click(await screen.findByText('评分选项'))
+    expect(await screen.findByText('符合条件')).toBeTruthy()
+  }
+
+  it('keeps filter records outside all jobs and shares their sent tag with the sent library', async () => {
+    const job = { id: 'filtered', company: '过滤测试公司', title: '测试岗位', status: 'filtered', score: 0, filter_library: 1, filter_reason: '薪资低于要求', created_at: '' }
+    const normalFetch = stubDashboardFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith('/api/jobs/search')) {
+        const library = new URL(url, 'http://localhost').searchParams.get('library')
+        const items = library === 'filtered' || (library === 'sent' && job.status === 'sent') ? [job] : []
+        return jsonResponse({ items, total: items.length, all_total: items.length })
+      }
+      if (url === '/api/jobs/status' && init?.method === 'POST') {
+        job.status = JSON.parse(String(init.body)).status
+        return jsonResponse({ affected_count: 1 })
+      }
+      return normalFetch(input, init)
+    }))
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<DashboardPage view="jobs" />)
+    fireEvent.click(await screen.findByRole('button', { name: '过滤库' }))
+    expect(await screen.findByText('过滤原因：薪资低于要求')).toBeTruthy()
+    fireEvent.change(screen.getByRole('combobox', { name: '修改 过滤测试公司 测试岗位 状态' }), { target: { value: 'sent' } })
+    await screen.findByText('已标记为已投递，可在“已投递库”查看；自动投递会跳过此岗位。')
+    fireEvent.click(screen.getByRole('button', { name: '已投递库' }))
+    expect(await screen.findByRole('combobox', { name: '修改 过滤测试公司 测试岗位 状态' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '全部岗位' }))
+    await waitFor(() => expect(screen.queryByRole('row', { name: /过滤测试公司/ })).toBeNull())
+  })
+
+  it('shows an outside-window run as unsent with counts and a concrete reason', async () => {
+    workbenchPayload = baseWorkbench({ last_task: buildTask({ mode: 'deliver', status: 'completed',
+      stop_reason: 'outside_window', metrics: { send_success: 0, send_failed: 0, send_deferred: 3 },
+      logs: ['招呼语发送结果：成功 0，失败 0，待下次发送 3'],
+    }) })
+    stubDashboardFetch()
+    render(<DashboardPage view="jobs" />)
+    expect(await screen.findByText('本次文字已送达 0 · 已沟通跳过 0 · 发送失败 0 · 未发送 3')).toBeTruthy()
+    expect(screen.getByText('未发送')).toBeTruthy()
+    expect(screen.getByText('当前不在发送时间窗口内，岗位已保留在“待发送招呼语”。')).toBeTruthy()
+    expect(screen.queryByText('已完成')).toBeNull()
+  })
+
+  it('opens preset management without selecting or sending any jobs', async () => {
+    const fetch = stubDashboardFetch()
+    render(<DashboardPage view="jobs" />)
+    fireEvent.click(await screen.findByRole('button', { name: '管理招呼搭配' }))
+    expect(await screen.findByText('可以提前保存文字和图片搭配，选中岗位后再确认批量发送。')).toBeTruthy()
+    expect((screen.getByRole('button', { name: '确认发送给 0 个岗位' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(fetch.mock.calls.some(([url]) => String(url) === '/api/workbench/deliver')).toBe(false)
+  })
+
+  it('reports existing contacts separately from new sends and failures', async () => {
+    workbenchPayload = baseWorkbench({ last_task: buildTask({ mode: 'deliver', status: 'completed',
+      metrics: { send_success: 0, send_existing_contact: 3, send_failed: 0, send_deferred: 0 },
+      logs: ['已核实历史沟通，本次未重复发送'],
+    }) })
+    stubDashboardFetch()
+    render(<DashboardPage view="jobs" />)
+    expect(await screen.findByText('本次文字已送达 0 · 已沟通跳过 3 · 发送失败 0 · 未发送 0')).toBeTruthy()
+    expect(screen.getByText('已结束')).toBeTruthy()
+  })
+
+  it('submits only selected unscored jobs directly to the delivery queue', async () => {
+    const job = { id: 'unscored', company: '未评分测试公司', title: '测试岗位', status: 'pending', score: 0, created_at: '' }
+    const normalFetch = stubDashboardFetch()
+    const calls = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith('/api/jobs/search')) return jsonResponse({ items: [job], total: 1, all_total: 1 })
+      if (url === '/api/workbench/deliver') return jsonResponse({ id: 'delivery-test' })
+      return normalFetch(input, init)
+    })
+    vi.stubGlobal('fetch', calls)
+    render(<DashboardPage view="jobs" />)
+    fireEvent.click(await screen.findByRole('checkbox', { name: '选择 未评分测试公司 测试岗位' }))
+    fireEvent.click(screen.getByRole('button', { name: 'BOSS 一键投递已选' }))
+    expect(await screen.findByRole('dialog', { name: '批量投递 · 自定义招呼' })).toBeTruthy()
+    expect(calls.mock.calls.some(([url]) => String(url) === '/api/workbench/deliver')).toBe(false)
+    fireEvent.change(screen.getByRole('textbox', { name: '自定义招呼语' }), { target: { value: '您好，我对这个岗位很感兴趣。' } })
+    fireEvent.click(screen.getByRole('button', { name: '确认发送给 1 个岗位' }))
+    await waitFor(() => expect(calls.mock.calls.some(([url]) => String(url) === '/api/workbench/deliver')).toBe(true))
+    const delivery = calls.mock.calls.find(([url]) => String(url) === '/api/workbench/deliver')!
+    expect(JSON.parse(String(delivery[1]?.body)).job_ids).toEqual(['unscored'])
+    expect(calls.mock.calls.some(([url]) => String(url) === '/api/scoring/start')).toBe(false)
+    expect(JSON.parse(String(delivery[1]?.body)).custom_greeting).toBe('您好，我对这个岗位很感兴趣。')
+  })
+
+  it('marks a manually applied BOSS job from the status menu and opens its sent library', async () => {
+    const job = { id: 'manual-boss', company: '手动投递测试公司', title: '测试岗位', source_platform: 'boss', status: 'ready', score: 80, created_at: '' }
+    const normalFetch = stubDashboardFetch()
+    const calls = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith('/api/jobs/search')) {
+        const statuses = new URL(url, 'http://localhost').searchParams.getAll('status')
+        const items = !statuses.length || statuses.includes(job.status) ? [job] : []
+        return jsonResponse({ items, total: items.length, all_total: 1 })
+      }
+      if (url === '/api/jobs/status' && init?.method === 'POST') {
+        job.status = JSON.parse(String(init.body)).status
+        return jsonResponse({ affected_count: 1 })
+      }
+      return normalFetch(input, init)
+    })
+    vi.stubGlobal('fetch', calls)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<DashboardPage view="jobs" />)
+    const menu = await screen.findByRole('combobox', { name: '修改 手动投递测试公司 测试岗位 状态' })
+    expect(within(menu).getByRole('option', { name: '已投递' })).toBeTruthy()
+    fireEvent.change(menu, { target: { value: 'sent' } })
+    await screen.findByText('已标记为已投递，可在“已投递库”查看；自动投递会跳过此岗位。')
+    expect(confirm.mock.calls[0][0]).toContain('不会发送消息')
+    expect(calls.mock.calls.some(([url, init]) => String(url) === '/api/jobs/status' && JSON.parse(String(init?.body)).status === 'sent')).toBe(true)
+    expect(screen.getByRole('combobox', { name: '修改 手动投递测试公司 测试岗位 状态' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '已投递库' }))
+    await waitFor(() => {
+      const urls = calls.mock.calls.map(([url]) => new URL(String(url), 'http://localhost'))
+      expect(urls.some(url => url.pathname === '/api/jobs/search' && url.searchParams.getAll('status').includes('sent') && url.searchParams.getAll('status').includes('replied'))).toBe(true)
+    })
+    expect(screen.getByRole('button', { name: '已投递库' }).getAttribute('aria-pressed')).toBe('true')
+    expect(within(screen.getByRole('row', { name: /手动投递测试公司/ })).getByRole('cell', { name: '已投递' })).toBeTruthy()
+    fireEvent.change(screen.getByRole('combobox', { name: '修改 手动投递测试公司 测试岗位 状态' }), { target: { value: 'ready' } })
+    await screen.findByText('岗位状态已更新。')
+    expect(confirm.mock.calls[1][0]).toContain('可能重新进入投递队列')
+    await waitFor(() => expect(screen.queryByRole('row', { name: /手动投递测试公司/ })).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: '全部岗位' }))
+    expect(await screen.findByRole('combobox', { name: '修改 手动投递测试公司 测试岗位 状态' })).toBeTruthy()
+    expect(within(screen.getByRole('row', { name: /手动投递测试公司/ })).getByRole('cell', { name: '待确认' })).toBeTruthy()
+  })
+
+  it('shares status and recruitment labels across all, campus, social and sent libraries', async () => {
+    const job = { id: 'shared', company: '分类测试公司', title: '嵌入式工程师', recruitment_type: 'campus', status: 'ready', score: 80, created_at: '' }
+    const other = { ...job, id: 'other', company: '其他公司', recruitment_type: 'experienced' }
+    const normalFetch = stubDashboardFetch()
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.startsWith('/api/jobs/search')) {
+        const params = new URL(url, 'http://localhost').searchParams
+        const statuses = params.getAll('status'), types = params.getAll('recruitment_type')
+        const items = [job, other].filter(item => (!statuses.length || statuses.includes(item.status)) && (!types.length || types.includes(item.recruitment_type)))
+        return jsonResponse({ items, total: items.length, all_total: 2 })
+      }
+      if (url === '/api/jobs/status' && init?.method === 'POST') {
+        job.status = JSON.parse(String(init.body)).status
+        return jsonResponse({ affected_count: 1 })
+      }
+      if (url === '/api/jobs/recruitment-type' && init?.method === 'POST') {
+        job.recruitment_type = JSON.parse(String(init.body)).recruitment_type
+        return jsonResponse({ affected_count: 1 })
+      }
+      return normalFetch(input, init)
+    }))
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    render(<DashboardPage view="jobs" />)
+    await screen.findByText('分类测试公司')
+    fireEvent.click(screen.getByRole('button', { name: '校招' }))
+    await waitFor(() => expect(screen.queryByText('其他公司')).toBeNull())
+    fireEvent.change(screen.getByRole('combobox', { name: '修改 分类测试公司 嵌入式工程师 状态' }), { target: { value: 'sent' } })
+    await screen.findByText('已标记为已投递，可在“已投递库”查看；自动投递会跳过此岗位。')
+    fireEvent.click(screen.getByRole('button', { name: '已投递库' }))
+    await screen.findByText('分类测试公司')
+    fireEvent.change(screen.getByRole('combobox', { name: '修改 分类测试公司 嵌入式工程师 招聘类型' }), { target: { value: 'experienced' } })
+    await screen.findByText('招聘类型已修改为社招，各岗位库已同步。')
+    expect(within(screen.getByRole('row', { name: /分类测试公司/ })).getByRole('cell', { name: '已投递' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '校招' }))
+    await waitFor(() => expect(screen.queryByText('分类测试公司')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: '社招' }))
+    await screen.findByText('分类测试公司')
+    expect(screen.getByText('其他公司')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '全部岗位' }))
+    await screen.findByText('分类测试公司')
+    expect(screen.getAllByRole('row')).toHaveLength(4) // headings, column filters, two jobs
+  })
+
+  it('closes the scoring dialog and shows the started notice after scoring starts', async () => {
+    stubDashboardFetch()
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    await openScoringDialog()
+    fireEvent.click(screen.getByText('确认开始评分'))
+    expect((await screen.findAllByText('独立评分已启动，共 3 个岗位。')).length).toBeGreaterThan(0)
+    await waitFor(() => expect(screen.queryByText('确认开始评分')).toBeNull())
+  })
+
+  it('keeps the progress visible in the jobs pool after the scoring dialog closes', async () => {
+    stubDashboardFetch({
+      '/api/scoring/start': () => {
+        workbenchPayload = baseWorkbench({ task: buildTask({ mode: 'score', metrics: { ai_total: 3, ai_completed: 0 } }) })
+        return jsonResponse({ run: { remaining_job_ids: ['a', 'b', 'c'] } })
+      },
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    await openScoringDialog()
+    fireEvent.click(screen.getByText('确认开始评分'))
+    await waitFor(() => expect(screen.queryByText('确认开始评分')).toBeNull())
+    expect((await screen.findByRole('progressbar', { name: 'AI 评分进度' })).getAttribute('aria-valuenow')).toBe('0')
+  })
+
+  it('refreshes progress, job scores and counts without losing the selection or requiring a page reload', async () => {
+    vi.useFakeTimers()
+    try {
+      let completed = 0
+      const job = { id: 'live-job', company: '测试公司', title: '测试岗位', city: '上海', score: 0, status: 'pending', salary: '20-30K', created_at: '' }
+      const normalFetch = stubDashboardFetch()
+      vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.startsWith('/api/jobs/search')) return jsonResponse({
+          items: [{ ...job, score: completed ? 88 : 0, status: completed ? 'scored' : 'pending' }],
+          total: completed ? 1 : 2, all_total: 2,
+        })
+        if (url === '/api/workbench') return jsonResponse(baseWorkbench({
+          task: completed === 2 ? null : buildTask({ mode: 'score', metrics: { ai_completed: completed, ai_total: 2 } }),
+          last_task: completed === 2 ? buildTask({ mode: 'score', status: 'completed', metrics: { ai_completed: 2, ai_total: 2 } }) : null,
+        }))
+        return normalFetch(input, init)
+      }))
+      await act(async () => { render(<DashboardPage view="jobs" />) })
+      fireEvent.click(screen.getByRole('checkbox', { name: '选择 测试公司 测试岗位' }))
+      expect(screen.getByText('筛选结果 2 / 总数 2')).toBeTruthy()
+      completed = 1
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(screen.getByRole('progressbar', { name: 'AI 评分进度' }).getAttribute('aria-valuenow')).toBe('50')
+      expect(screen.getByText('88')).toBeTruthy()
+      expect(screen.getByText('筛选结果 1 / 总数 2')).toBeTruthy()
+      expect((screen.getByRole('checkbox', { name: '选择 测试公司 测试岗位' }) as HTMLInputElement).checked).toBe(true)
+      expect(screen.queryByText('加载中…')).toBeNull()
+      completed = 2
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(screen.getByRole('progressbar', { name: 'AI 评分进度' }).getAttribute('aria-valuenow')).toBe('100')
+      expect(screen.getByText('本轮 AI 评分 · 本轮处理完毕')).toBeTruthy()
+    } finally {
+      cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the scoring dialog open and shows the failure inside it when the scoring start fails', async () => {
+    stubDashboardFetch({
+      '/api/scoring/start': () => jsonResponse({ error: 'AI 额度不足' }, false),
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    await openScoringDialog()
+    fireEvent.click(screen.getByText('确认开始评分'))
+    expect(await screen.findByText('AI 额度不足')).toBeTruthy()
+    expect(screen.getByText('确认开始评分')).toBeTruthy()
+  })
+})

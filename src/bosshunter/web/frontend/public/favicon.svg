@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <defs>
+    <linearGradient id="jp-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="50%" stop-color="#4f46e5"/>
+      <stop offset="100%" stop-color="#1e1b4b"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="url(#jp-grad)"/>
+  <path d="M16 4.5L25 24L16 20L7 24L16 4.5Z" fill="white" fill-opacity="0.3" stroke="white" stroke-width="1.8" stroke-linejoin="round"/>
+  <path d="M16 20V12" stroke="#67e8f9" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="16" cy="10" r="1.5" fill="#67e8f9"/>
+</svg>

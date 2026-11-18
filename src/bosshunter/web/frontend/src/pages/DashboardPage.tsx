@@ -1,0 +1,3179 @@
+import { OutsourcingBadge } from '@/components/jobs/OutsourcingBadge'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useDashboard, type CollectionProgress, type HistoryItem, type Job, type WorkbenchTask } from '@/hooks/useDashboard'
+import { useJobSearch, type JobSortKey, type JobSortOrder } from '@/hooks/useJobSearch'
+import { Button } from '@/components/ui/button'
+import { START_ONBOARDING_EVENT } from '@/components/onboarding/OnboardingTour'
+import { JobsTable } from '@/components/dashboard/JobsTable'
+import { CompanySearchLibrary } from '@/components/dashboard/CompanySearchLibrary'
+import { RecycleBinPanel } from '@/components/dashboard/RecycleBinPanel'
+import { TaskScoringProgress } from '@/components/dashboard/ScoringProgress'
+import { ScoreJobsDialog } from '@/components/dashboard/ScoreJobsDialog'
+import { CollectJobsDialog } from '@/components/dashboard/CollectJobsDialog'
+import { DeliveryDialog, type CustomDelivery } from '@/components/dashboard/DeliveryDialog'
+import { TrendChart } from '@/components/dashboard/TrendChart'
+import { TopCompanies } from '@/components/dashboard/TopCompanies'
+import { PipelineFlow } from '@/components/dashboard/PipelineFlow'
+import { RecentActivity } from '@/components/dashboard/RecentActivity'
+import type { ActivityData, TopCompany } from '@/hooks/useDashboard'
+import { JobFilterBar } from '@/components/jobs/JobFilterBar'
+import { JobSwipeView } from '@/components/jobs/JobSwipeView'
+import { InterviewPreparation } from '@/components/jobs/InterviewPreparation'
+import { parseHistoryDetail } from '@/lib/historyDetail'
+import { PLATFORM_LABELS } from '@/lib/platforms'
+import {
+  EMPTY_JOB_FILTERS,
+  filterJobs,
+  hasInvalidSalaryRange,
+  jobCityBaseName,
+  useDebouncedValue,
+  type JobFilters,
+} from '@/lib/jobFilters'
+import { getActionLabel, getStatusLabel } from '@/lib/status'
+import { describeGreetTaskOutcome, greetPauseReasonLabel } from '@/lib/greetTask'
+import { cn } from '@/lib/utils'
+import {
+  AlertTriangle,
+  BriefcaseBusiness,
+  ChevronDown,
+  Download,
+  ExternalLink,
+  Eye,
+  MessageCircle,
+  Pencil,
+  Play,
+  RefreshCw,
+  ShieldCheck,
+  Send,
+  Sparkles,
+  Square,
+  Table as TableIcon,
+  Trash2,
+  XCircle,
+} from 'lucide-react'
+
+type WorkbenchMode = 'full' | 'collect' | 'rescore' | 'monitor'
+type DashboardView = 'workbench' | 'jobs' | 'monitor'
+type StatsScope = 'today' | 'total'
+
+const TASK_STAGE_LABELS = [
+  '开始采集岗位',
+  '开始 AI 评分',
+  '开始重新评分',
+  'AI 评分进度',
+  '等待前端确认投递',
+  '发送失败待处理',
+  '执行一轮监测',
+  '本轮监测完成，30 分钟后再次检查',
+]
+
+function currentTaskStage(task: WorkbenchTask) {
+  if (task.progress?.outcome === 'scoring' && ['running', 'stopping'].includes(task.status)) {
+    const completed = task.metrics?.ai_completed
+    const total = task.metrics?.ai_total
+    return typeof total === 'number'
+      ? `AI 评分进度 ${completed || 0}/${total}`
+      : '采集已结束，正在为本轮新增岗位进行 AI 评分'
+  }
+  const logs = task.logs || []
+  for (const log of logs.slice().reverse()) {
+    if (log.includes('AI 评分进度')) return log
+    if (log.includes('招呼语进度')) return log
+    if (log.includes('招呼语发送结果')) return log
+    if (log.includes('发送招呼语')) return '发送招呼语'
+    if (log.includes('招呼语生成结果')) return log
+    if (log.includes('生成招呼语')) return log
+    if (log.includes('本轮监测完成')) return log
+    const stage = TASK_STAGE_LABELS.find(label => log.includes(label))
+    if (stage) return stage
+  }
+  if (task.status === 'running') return `${task.label}正在启动`
+  if (task.status === 'stopping') return `${task.label}正在停止`
+  if (task.status === 'completed') return `${task.label}已完成`
+  if (task.status === 'stopped') return `${task.label}已停止`
+  if (task.status === 'failed') return `${task.label}运行失败`
+  return `${task.label}状态未知`
+}
+
+function taskProgressSummary(task: WorkbenchTask) {
+  if (task.waiting_for) return task.waiting_for
+  if (task.metrics?.ai_total !== undefined && (task.mode === 'score' || task.mode === 'rescore' || task.progress?.outcome === 'scoring')) {
+    return `AI 评分 ${task.metrics.ai_completed || 0}/${task.metrics.ai_total}`
+  }
+  if (task.progress?.platforms) {
+    return Object.entries(task.progress.platforms).map(([platform, state]) =>
+      `${PLATFORM_LABELS[platform] || platform}：新增 ${state.new || 0} 条${state.target ? ` / 目标 ${state.target} 条` : ''}`,
+    ).join('；')
+  }
+  return currentTaskStage(task).split('\n')[0]
+}
+
+function taskStatusText(status: string) {
+  if (status === 'failed') return '运行失败'
+  if (status === 'completed') return '已结束'
+  if (status === 'stopped') return '已停止'
+  if (status === 'stopping') return '停止中'
+  return '运行中'
+}
+
+function taskStatusClass(status: string) {
+  if (status === 'failed') return 'border-danger-border bg-danger-soft'
+  if (status === 'completed' || status === 'stopped') return 'border-card-border bg-card'
+  return 'border-primary/20 bg-secondary'
+}
+
+function taskStatusTitle(status: string) {
+  if (status === 'completed' || status === 'stopped') return '最近任务状态'
+  return '当前阶段'
+}
+
+function taskStopReasonLabel(reason?: string) {
+  if (reason === 'daily_limit') return '今日发送额度已用完，岗位已保留在“待发送招呼语”；明日额度恢复后再重试。'
+  if (reason === 'outside_window') return '当前不在发送时间窗口内，岗位已保留在“待发送招呼语”。'
+  if (reason === 'day_off') return '今日触发防检测休息策略，岗位已保留在“待发送招呼语”。'
+  if (reason === 'no_ready_jobs') return '没有可执行发送的岗位，请检查招呼语和岗位状态。'
+  if (reason === 'stopped') return '任务已按你的要求停止，尚未处理的岗位仍保留在队列中。'
+  return reason
+}
+
+function taskErrorFeedback(error: string) {
+  const normalized = error.toLowerCase()
+  if (
+    normalized.includes('api key')
+    || normalized.includes('authentication')
+    || normalized.includes('unauthorized')
+    || normalized.includes('401')
+    || normalized.includes('403')
+  ) {
+    return {
+      title: 'AI 接口认证失败',
+      detail: '请到“配置 → AI 设置”检查 API Key、Base URL 和模型名称，保存后点击“测试连接”。',
+    }
+  }
+  if (
+    normalized.includes('chrome')
+    || normalized.includes('cdp')
+    || normalized.includes('websocket')
+    || normalized.includes('browser runtime')
+    || normalized.includes('not connected')
+  ) {
+    return {
+      title: 'Google Chrome 连接中断',
+      detail: '请确认 Chrome 已启动并开启远程调试，再点击上方“全流程预检”。',
+    }
+  }
+  if (normalized.includes('zhipin') || normalized.includes('登录') || normalized.includes('login')) {
+    return {
+      title: '招聘平台页面或登录状态异常',
+      detail: '请在已连接的 Google Chrome 中打开 BOSS 直聘并确认账号仍处于登录状态。',
+    }
+  }
+  return {
+    title: '任务运行失败',
+    detail: '请查看原始错误；修复配置或连接问题后，重新运行启动检查。',
+  }
+}
+
+interface DashboardPageProps {
+  view?: DashboardView
+}
+
+interface PreflightCheck {
+  id: string
+  title: string
+  status: 'pass' | 'warning' | 'error'
+  message: string
+  detail: string
+  action?: 'config' | 'browser' | ''
+}
+
+const modes: Array<{ mode: WorkbenchMode; title: string; description: string }> = [
+  {
+    mode: 'full',
+    title: '运行全流程',
+    description: '采集、评分、监测，投递前由你确认',
+  },
+  {
+    mode: 'collect',
+    title: '单独采集',
+    description: '按平台和条件搜索岗位',
+  },
+  {
+    mode: 'monitor',
+    title: '单独监测',
+    description: '跟进已投递岗位的 HR 回复',
+  },
+]
+
+const statItems = [
+  { key: '采集总数', todayLabel: '今日新增岗位', totalLabel: '累计采集岗位' },
+  { key: '初筛通过', todayLabel: '今日初筛通过', totalLabel: '累计初筛通过', highlight: true },
+  { key: 'AI评分', todayLabel: '今日 AI 评分', totalLabel: '累计 AI 评分' },
+  { key: 'pending', todayLabel: '当前待确认', totalLabel: '当前待确认', highlight: true, current: true },
+  { key: '发送', todayLabel: '今日已投递', totalLabel: '累计已投递', highlight: true },
+]
+
+const taskMetricItems = [
+  { key: 'collect_seen', label: '本轮扫描' },
+  { key: 'collect_new', label: '本轮新增' },
+  { key: 'collect_duplicate', label: '重复岗位' },
+  { key: 'collect_filtered', label: '过滤' },
+  { key: 'collect_parse_failed', label: '解析失败' },
+  { key: 'collect_save_failed', label: '保存失败' },
+  { key: 'ai_completed', label: 'AI已完成' },
+  { key: 'ai_total', label: 'AI总数' },
+  { key: 'ai_passed', label: 'AI通过' },
+  { key: 'ai_filtered', label: 'AI过滤' },
+  { key: 'ai_failed', label: 'AI失败' },
+  { key: 'send_success', label: '发送成功' },
+  { key: 'send_existing_contact', label: '已沟通跳过' },
+  { key: 'send_deferred', label: '待下次发送' },
+  { key: 'send_remaining_quota', label: '今日剩余额度' },
+  { key: 'greet_generated', label: '新生成' },
+  { key: 'greet_preserved', label: '保留现有' },
+  { key: 'greet_failed', label: '生成失败' },
+  { key: 'greet_paused', label: '提前暂停' },
+]
+
+const TERMINAL_TASK_STATUSES = ['completed', 'failed', 'stopped']
+
+async function waitForGreetTask(taskId: string, timeoutMs = 300000): Promise<WorkbenchTask | null> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const res = await fetch('/api/workbench')
+    if (res.ok) {
+      const data: { task?: WorkbenchTask | null; last_task?: WorkbenchTask | null; tasks?: WorkbenchTask[] } = await res.json().catch(() => ({}))
+      const task = data.tasks?.find(item => item.id === taskId) || (data.task?.id === taskId
+        ? data.task
+        : data.last_task?.id === taskId ? data.last_task : null)
+      if (task && TERMINAL_TASK_STATUSES.includes(task.status)) return task
+    }
+    await new Promise(resolve => setTimeout(resolve, 2000))
+  }
+  return null
+}
+
+function jobSubtitle(job: Job) {
+  return [job.score ? `匹配 ${job.score}` : '', job.salary, job.hr_active || '活跃度未知', getStatusLabel(job.status)].filter(Boolean).join(' · ')
+}
+
+function safeExternalUrl(value: string | undefined, platform: string) {
+	if (!value) return ''
+	try {
+		const url = new URL(value)
+		if (url.protocol !== 'https:') return ''
+		const allowedDomain = platform === 'zhilian'
+			? 'zhaopin.com'
+			: platform === '51job'
+				? '51job.com'
+				: platform === 'liepin'
+					? 'liepin.com'
+					: ''
+		if (!allowedDomain) return ''
+		return url.hostname === allowedDomain || url.hostname.endsWith(`.${allowedDomain}`) ? url.href : ''
+	} catch {
+		return ''
+	}
+}
+
+function monitorChatUrl(item: HistoryItem) {
+  const platform = item.source_platform || 'boss'
+	if (platform === 'boss') return ''
+	return safeExternalUrl(item.url, platform)
+}
+
+function monitorLinkLabel(item: HistoryItem) {
+  return (item.source_platform || 'boss') === 'boss' ? '打开聊天对话' : '打开对应页面'
+}
+
+async function parsePreflightResponse(res: Response) {
+  const rawText = await res.text()
+  let data: { ok?: boolean; messages?: unknown; checks?: unknown; error?: string } = {}
+  try {
+    data = rawText ? JSON.parse(rawText) : {}
+  } catch {
+    const message = `无法解析预检响应：预检接口返回 ${res.status}`
+    return {
+      ok: false,
+      messages: [message],
+      checks: [{ id: 'preflight_api', title: '启动检查', status: 'error', message, detail: '请重启 JobPilot 后重试。' }] as PreflightCheck[],
+    }
+  }
+  const messages = Array.isArray(data.messages) ? [...new Set(data.messages.map(String).filter(Boolean))] : []
+  const checks = Array.isArray(data.checks)
+    ? data.checks.filter((item): item is PreflightCheck => Boolean(
+      item
+      && typeof item === 'object'
+      && 'id' in item
+      && 'status' in item
+      && 'message' in item
+    ))
+    : []
+  if (data.error && !messages.includes(String(data.error))) messages.push(String(data.error))
+  const hasActionableChecks = checks.some(check => check.status !== 'pass')
+  if (!res.ok && !hasActionableChecks && messages.length === 0) messages.push(`预检接口返回 ${res.status}`)
+  if (!data.ok && !hasActionableChecks && messages.length === 0) messages.push('后端未返回具体原因')
+  if ((!res.ok || !data.ok) && !hasActionableChecks && messages.length > 0) {
+    checks.push(...messages.map((message, index) => ({
+      id: `legacy-${index}`,
+      title: '启动检查',
+      status: 'error' as const,
+      message,
+      detail: !res.ok ? `接口状态：HTTP ${res.status}。请修复后重新检查。` : '',
+    })))
+  }
+  return { ok: Boolean(res.ok && data.ok), messages, checks }
+}
+
+function CompactNotice({ message, danger = false }: { message: string; danger?: boolean }) {
+  return (
+    <details className={cn('group mt-2 rounded-lg px-2 text-xs', danger ? 'bg-danger-soft text-danger' : 'bg-secondary text-primary')}>
+      <summary className="flex h-8 cursor-pointer list-none items-center gap-2 [&::-webkit-details-marker]:hidden">
+        <span role="status" className="min-w-0 flex-1 truncate" title={message}>{message}</span>
+        <ChevronDown className="h-3 w-3 shrink-0 group-open:rotate-180" />
+      </summary>
+      <p className="break-words border-t border-current/10 py-2 leading-5">{message}</p>
+    </details>
+  )
+}
+
+function PreflightPanel({
+  checks,
+  checking,
+  onRetry,
+}: {
+  checks: PreflightCheck[]
+  checking: boolean
+  onRetry: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const actionableChecks = checks.filter(check => check.status !== 'pass')
+  if (actionableChecks.length === 0) return null
+
+  const errors = actionableChecks.filter(check => check.status === 'error').length
+  const needsConfig = actionableChecks.some(check => check.action === 'config')
+  const heading = `${actionableChecks.length} 项${errors ? '待处理' : '提醒'}`
+  const summary = `${heading} · ${actionableChecks[0].message}`
+
+  return (
+    <div role="region" aria-label="启动检查结果" className={`mt-2 rounded-lg border px-2 text-xs ${
+      errors ? 'border-danger-border bg-danger-soft' : 'border-warning-border bg-warning-soft'
+    }`}>
+      <div className="flex h-8 min-w-0 items-center gap-2">
+        {errors
+          ? <XCircle className="h-3.5 w-3.5 shrink-0 text-danger" />
+          : <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" />}
+        <span role="status" title={summary} className="min-w-0 flex-1 truncate text-foreground">{summary}</span>
+        <button type="button" aria-expanded={expanded} aria-controls="preflight-details" onClick={() => setExpanded(value => !value)} className="flex h-7 shrink-0 items-center gap-1 rounded px-1 text-muted hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
+          {expanded ? '收起' : '详情'}<ChevronDown className={cn('h-3 w-3', expanded && 'rotate-180')} />
+        </button>
+        {needsConfig && (
+          <Button variant="ghost" size="sm" className="h-7 shrink-0 px-1" onClick={() => window.location.assign('/config')}>
+            配置
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" className="h-7 shrink-0 px-1" onClick={onRetry} disabled={checking}>
+          <RefreshCw className={`mr-1 h-3 w-3 ${checking ? 'animate-spin' : ''}`} />
+          {checking ? '检查中' : '重新检查'}
+        </Button>
+      </div>
+      <div id="preflight-details" hidden={!expanded} className="space-y-2 border-t border-current/10 py-2 text-xs leading-5">
+        {actionableChecks.map(check => (
+          <div key={`${check.id}-${check.title}`} className="break-words">
+            <p className="text-foreground"><span className="font-semibold">{check.title}：</span>{check.message}</p>
+            {check.detail && <p className="text-muted">{check.detail}</p>}
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function GettingStartedCard({
+  onCheck,
+  checking,
+  notice,
+  checks,
+  onRetry,
+}: {
+  onCheck: () => void
+  checking: boolean
+  notice: string
+  checks: PreflightCheck[]
+  onRetry: () => void
+}) {
+  return (
+    <section aria-label="开始使用" className="rounded-2xl border border-primary/30 bg-card p-4">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <div className="mb-1 flex items-center gap-2">
+            <span className="rounded-md bg-primary/15 px-2 py-0.5 text-[11px] font-bold text-primary">首次使用</span>
+            <h2 className="text-lg font-black text-foreground">开始使用</h2>
+          </div>
+          <p className="text-sm text-muted">跟着页面提示，完成简历、搜索和 AI 配置，再检查运行环境。</p>
+        </div>
+        <Button size="sm" onClick={() => window.dispatchEvent(new Event(START_ONBOARDING_EVENT))}>开始交互引导</Button>
+      </div>
+      <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-card-border pt-3">
+        <p className="max-w-xl text-xs leading-5 text-muted">单独采集且关闭自动评分时，可先跳过简历和 AI 设置；运行全流程前请完成全部准备。</p>
+        <div className="flex flex-wrap items-center gap-3">
+          <a data-tour="chrome-guide" className="text-xs font-semibold text-primary underline-offset-2 hover:underline" href="https://github.com/shengjidaguai-china/BossHunter/blob/main/docs/QUICKSTART.md#3-开启-chrome-远程调试" target="_blank" rel="noreferrer">连接 Chrome 说明 ↗</a>
+          <Button data-tour="check-preflight" variant="secondary" size="sm" onClick={onCheck} disabled={checking}>
+            <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />
+            {checking ? '检查中' : '检查准备情况'}
+          </Button>
+        </div>
+      </div>
+      {notice && <CompactNotice message={notice} />}
+      {checks.some(check => check.status !== 'pass') && (
+        <PreflightPanel checks={checks} checking={checking} onRetry={onRetry} />
+      )}
+    </section>
+  )
+}
+
+export default function DashboardPage({ view = 'workbench' }: DashboardPageProps) {
+  const {
+    workbench,
+    history,
+    loading,
+    error,
+    refreshing,
+    lastRefreshedAt,
+    refresh,
+    updateGreetingJob,
+    updateJobStatus,
+    startTask,
+    stopTask,
+  } = useDashboard(view)
+  const [selected, setSelected] = useState<string[]>([])
+  const [batchDeliverySelection, setBatchDeliverySelection] = useState<string[] | null>(null)
+  const [notice, setNotice] = useState('')
+
+  // Dashboard visualization state
+  const [activityData, setActivityData] = useState<ActivityData[]>([])
+  const [topCompanies, setTopCompanies] = useState<TopCompany[]>([])
+  const [recentActivity, setRecentActivity] = useState<HistoryItem[]>([])
+  const [preflightChecks, setPreflightChecks] = useState<PreflightCheck[]>([])
+  const [preflightMode, setPreflightMode] = useState<WorkbenchMode>('full')
+  const [selectedJob, setSelectedJob] = useState<Job | null>(null)
+  const [modePending, setModePending] = useState<WorkbenchMode | null>(null)
+  const [sendingGreetingIds, setSendingGreetingIds] = useState<Set<string>>(new Set())
+  const [busyGreetingIds, setBusyGreetingIds] = useState<Set<string>>(new Set())
+  const onGreetingBusyChange = useCallback((id: string, busy: boolean) => {
+    setBusyGreetingIds(previous => {
+      const next = new Set(previous)
+      if (busy) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  }, [])
+  const [confirmedDeliveryIds, setConfirmedDeliveryIds] = useState<Set<string>>(new Set())
+  const [todayFilters, setTodayFilters] = useState<JobFilters>({ ...EMPTY_JOB_FILTERS })
+  const [statsScope, setStatsScope] = useState<StatsScope>('today')
+  const [collectDialogOpen, setCollectDialogOpen] = useState(false)
+  const [collectDialogMode, setCollectDialogMode] = useState<'collect' | 'full'>('collect')
+  const [preflightRunning, setPreflightRunning] = useState(false)
+  const [generatingGreetings, setGeneratingGreetings] = useState(false)
+  const startedGreetTaskIdRef = useRef<string | null>(null)
+
+  const todayJobs = useMemo(
+    () => workbench.pending_confirmation.filter(job => !confirmedDeliveryIds.has(job.id)),
+    [workbench.pending_confirmation, confirmedDeliveryIds]
+  )
+  const todayCityOptions = useMemo(
+    () => [...new Set(todayJobs.map(job => jobCityBaseName(job.city)).filter(Boolean))].sort(),
+    [todayJobs]
+  )
+  const debouncedTodayQuery = useDebouncedValue(todayFilters.query, 250)
+  const activeTodayFilterCount = Object.values(todayFilters).filter(value => Array.isArray(value) ? value.length > 0 : value !== '').length
+  const effectiveTodayFilters = useMemo(
+    () => ({ ...todayFilters, query: debouncedTodayQuery }),
+    [todayFilters, debouncedTodayQuery]
+  )
+  const filteredTodayJobs = useMemo(
+    () => filterJobs(todayJobs, effectiveTodayFilters),
+    [todayJobs, effectiveTodayFilters]
+  )
+  const visibleJobIds = useMemo(() => new Set(filteredTodayJobs.map(job => job.id)), [filteredTodayJobs])
+  const actionableSelected = useMemo(() => selected.filter(id => visibleJobIds.has(id)), [selected, visibleJobIds])
+
+  useEffect(() => {
+    setSelected(previous => {
+      const next = previous.filter(id => visibleJobIds.has(id))
+      return next.length === previous.length ? previous : next
+    })
+  }, [visibleJobIds])
+
+  useEffect(() => {
+    const handleConfigSaved = () => { void refresh() }
+    window.addEventListener('bosshunter-config-saved', handleConfigSaved)
+    return () => window.removeEventListener('bosshunter-config-saved', handleConfigSaved)
+  }, [refresh])
+
+  // Keep the homepage overview separate from the monitor's conversation history.
+  useEffect(() => {
+    if (view !== 'workbench') return
+    const controller = new AbortController()
+    const fetchOverview = async <T,>(url: string, update: (data: T) => void) => {
+      const response = await fetch(url, { cache: 'no-store', signal: controller.signal })
+      if (!response.ok) return
+      const data: T = await response.json()
+      if (!controller.signal.aborted) update(data)
+    }
+    const fetchVisualizationData = async () => {
+      // One unavailable chart must not prevent the other overview cards loading.
+      await Promise.allSettled([
+        fetchOverview('/api/activity?days=7', setActivityData),
+        fetchOverview('/api/top-companies?limit=5', setTopCompanies),
+        fetchOverview('/api/history?limit=3', setRecentActivity),
+      ])
+    }
+    void fetchVisualizationData()
+    const interval = window.setInterval(fetchVisualizationData, 60000)
+    return () => {
+      controller.abort()
+      window.clearInterval(interval)
+    }
+  }, [view])
+
+  const pendingGreetingJobs = workbench.pending_greetings
+  const reviewedGreetingJobs = pendingGreetingJobs.filter(job => job.greeting_selection !== 'pending')
+  const pendingGreetingReviewCount = pendingGreetingJobs.length - reviewedGreetingJobs.length
+  const activeTasks = workbench.active_tasks || (workbench.task ? [workbench.task] : [])
+  const [focusedTaskId, setFocusedTaskId] = useState('')
+  const activeTask = activeTasks.find(task => task.id === focusedTaskId) || activeTasks[0] || null
+  const visibleTask = (workbench.tasks || []).find(task => task.id === focusedTaskId) || activeTask || workbench.last_task
+  const visibleTaskError = visibleTask?.error ? taskErrorFeedback(visibleTask.error) : null
+  const fullStage = visibleTask ? currentTaskStage(visibleTask) : ''
+  const hasStageDetails = fullStage.trim().includes('\n')
+  const detailMetrics = taskMetricItems.filter(item => {
+    const metrics = visibleTask?.metrics || {}
+    if (!(item.key in metrics)) return false
+    if (item.key.startsWith('collect_') && visibleTask?.progress?.platforms) return false
+    if (['collect_seen', 'collect_new', 'ai_passed', 'send_success', 'greet_generated'].includes(item.key)) return false
+    return !(item.key.endsWith('_failed') && Number(metrics[item.key]) > 0)
+  })
+  const greetTaskRunning = activeTasks.some(task => task.mode === 'greet')
+
+  useEffect(() => {
+    const startedId = startedGreetTaskIdRef.current
+    if (!startedId) return
+    const greetTask = workbench.tasks?.find(task => task.id === startedId) || (activeTask?.id === startedId
+      ? activeTask
+      : workbench.last_task?.id === startedId ? workbench.last_task : null)
+    if (!greetTask || !TERMINAL_TASK_STATUSES.includes(greetTask.status)) return
+    startedGreetTaskIdRef.current = null
+    if (greetTask.status === 'completed') {
+      setNotice(describeGreetTaskOutcome(greetTask))
+    }
+    void refresh()
+  }, [activeTask, workbench.tasks, workbench.last_task, refresh])
+
+  const taskSummary = visibleTask
+    ? visibleTaskError?.title || taskStopReasonLabel(visibleTask.stop_reason) || currentTaskStage(visibleTask)
+    : ''
+  const pendingReplies = history.filter(item => item.action === 'reply_pending')
+
+  const toggleJob = (id: string) => {
+    setSelected(prev => (prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]))
+  }
+
+  const runPreflight = async (mode: WorkbenchMode, options?: Record<string, unknown>) => {
+    setPreflightMode(mode)
+    const res = options
+      ? await fetch('/api/workbench/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, options }),
+      })
+      : await fetch(`/api/workbench/preflight?mode=${mode}`)
+    const data = await parsePreflightResponse(res)
+    setPreflightChecks(data.checks)
+    if (!data.ok) {
+      setNotice('')
+      return false
+    }
+    return true
+  }
+
+  const handleModeClick = async (mode: WorkbenchMode) => {
+    try {
+      const sameTask = mode === 'collect' ? null : activeTasks.find(task => task.mode === mode)
+      if (activeTask?.mode === mode) {
+        if (window.confirm(`是否停止当前${activeTask.label}任务？已入库岗位会保留。`)) {
+          setModePending(mode)
+          setNotice(`正在停止${activeTask.label}...`)
+          await stopTask(activeTask.id)
+          setNotice(`${activeTask.label}已请求停止。`)
+        }
+        return
+      }
+      if (sameTask) {
+        if (window.confirm(`是否停止当前${sameTask.label}任务？已入库岗位会保留。`)) {
+          setModePending(mode)
+          setNotice(`正在停止${sameTask.label}...`)
+          await stopTask(sameTask.id)
+          setNotice(`${sameTask.label}已请求停止。`)
+        }
+        return
+      }
+      if (modePending) return
+      if (mode === 'full') {
+        setCollectDialogMode('full')
+        setCollectDialogOpen(true)
+        return
+      }
+      const target = modes.find(item => item.mode === mode)
+      setModePending(mode)
+      setNotice(`${target?.title || '任务'}启动前预检中...`)
+      if (!(await runPreflight(mode))) return
+      setNotice(`${target?.title || '任务'}启动中，请稍候...`)
+      await startTask(mode)
+      setNotice(`${target?.title || '任务'}已启动，日志会在下方更新。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '操作失败')
+    } finally {
+      setModePending(null)
+    }
+  }
+
+  const retryPreflight = async () => {
+    if (modePending) return
+    try {
+      setModePending(preflightMode)
+      setNotice('正在重新检查运行环境...')
+      await runPreflight(preflightMode)
+      setNotice('')
+    } catch {
+      setNotice('重新检查失败，请确认 JobPilot 后端仍在运行。')
+    } finally {
+      setModePending(null)
+    }
+  }
+
+  const runStandalonePreflight = async () => {
+    if (modePending || preflightRunning) return
+    try {
+      setPreflightRunning(true)
+      setNotice('正在检查全流程运行环境...')
+      const ok = await runPreflight('full')
+      setNotice(ok ? '全流程预检通过，可以开始任务。' : '')
+    } catch {
+      setNotice('预检失败，请确认 JobPilot 后端仍在运行。')
+    } finally {
+      setPreflightRunning(false)
+    }
+  }
+
+  const startCollection = async (options: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> => {
+    const mode = collectDialogMode
+    setModePending(mode)
+    setNotice(mode === 'full' ? '全流程启动前预检中...' : '岗位采集启动前预检中...')
+    try {
+      if (!(await runPreflight(mode, options))) {
+        setNotice('启动前预检未通过：请按下方检查提示修复后，再重新启动。')
+        return { ok: false, error: '启动前预检未通过：请关闭弹窗后按检查提示修复，再重新启动。' }
+      }
+      setNotice('启动前预检通过，正在启动任务...')
+      await startTask(mode, options)
+      setNotice(mode === 'full' ? '全流程已启动，进度会在下方更新。' : '岗位采集已启动，进度会在下方更新。')
+      return { ok: true }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '岗位采集启动失败'
+      setNotice(message)
+      return { ok: false, error: message }
+    } finally {
+      setModePending(null)
+    }
+  }
+
+  const confirmDeliver = async (content: CustomDelivery) => {
+    const ids = batchDeliverySelection || []
+    if (!ids.length) return
+    const count = ids.length
+    try {
+      const res = await fetch('/api/workbench/deliver', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: ids, ...content }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '投递失败')
+      }
+      const data = await res.json().catch(() => ({}))
+      if (!ids.some(id => workbench.send_errors.some(job => job.id === id))) {
+        setConfirmedDeliveryIds(prev => new Set([...prev, ...ids]))
+      }
+      await refresh()
+      setNotice(
+        data.already_queued_count === count
+          ? `所选 ${count} 个岗位已在当前发送队列中。`
+          : data.queued_count
+            ? `已将 ${data.queued_count} 个岗位追加到当前发送队列。`
+            : `已提交 ${count} 个岗位，是否送达请查看发送结果。`
+      )
+      setSelected(prev => prev.filter(id => !new Set(ids).has(id)))
+      setBatchDeliverySelection(null)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '投递失败')
+      throw err
+    }
+  }
+
+  const rejectSelectedJobs = async (ids: string[]) => {
+    if (!ids.length) return
+    const count = ids.length
+    if (!window.confirm(`确定放弃这 ${count} 个岗位吗？放弃后不会进入投递，可在岗位池中查看已拒绝状态。`)) return
+    try {
+      const res = await fetch('/api/workbench/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: ids }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '放弃失败')
+      }
+      const rejectedIds = new Set(ids)
+      setSelected(prev => prev.filter(id => !rejectedIds.has(id)))
+      setConfirmedDeliveryIds(prev => new Set([...prev, ...ids]))
+      await refresh()
+      setNotice(`已放弃 ${count} 个岗位。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '放弃失败')
+    }
+  }
+
+  const generateGreetings = async (ids: string[]) => {
+    if (!ids.length) return
+    setGeneratingGreetings(true)
+    try {
+      const res = await fetch('/api/workbench/greetings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: ids }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.error || '生成招呼语失败')
+      }
+      startedGreetTaskIdRef.current = data.task?.id ?? null
+      await refresh()
+      setNotice(`已开始为 ${ids.length} 个岗位生成招呼语，可在任务面板查看进度并随时停止。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '生成招呼语失败')
+    } finally {
+      setGeneratingGreetings(false)
+    }
+  }
+
+  const sendReadyGreetings = async (ids: string[]) => {
+    if (!ids.length || ids.some(id => sendingGreetingIds.has(id) || busyGreetingIds.has(id) || pendingGreetingJobs.find(job => job.id === id)?.greeting_activity)) return
+    const count = ids.length
+    // 人工确认门控：直接发送前必须显式确认，防止误触批量联系招聘方。
+    if (!window.confirm(`确认向所选 ${count} 个岗位发送招呼语？\n发送将立即开始并受每日额度与发送时间窗口限制。`)) return
+    setSendingGreetingIds(prev => new Set([...prev, ...ids]))
+    setNotice(`正在将 ${count} 个岗位加入发送队列...`)
+    try {
+      const res = await fetch('/api/workbench/deliver', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: ids, direct_send: true }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '发送失败')
+      }
+      const data = await res.json().catch(() => ({}))
+      await refresh()
+      setNotice(
+        data.already_queued_count === count
+          ? `所选 ${count} 个岗位已在当前发送队列中，请等待依次发送。`
+          : data.queued_count
+            ? `已将 ${data.queued_count} 个岗位追加到当前发送队列。`
+            : `已直接进入发送流程 ${count} 个岗位。`
+      )
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '发送失败')
+    } finally {
+      setSendingGreetingIds(prev => new Set([...prev].filter(id => !ids.includes(id))))
+    }
+  }
+
+  const selectGreeting = async (
+    job: Job,
+    selection: 'original' | 'optimized' | 'edited',
+    greeting = '',
+  ) => {
+    const res = await fetch(`/api/jobs/${job.id}/greeting-selection`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ selection, greeting, confirmed: true }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(data.error || '保存招呼语选择失败')
+    updateGreetingJob(data)
+    await refresh()
+    setNotice(
+      selection === 'original'
+        ? '已保留原文，后续生成不会覆盖。'
+        : selection === 'optimized'
+          ? '已采用优化版，后续生成不会覆盖。'
+          : '已保存手动编辑版本，后续生成不会覆盖。'
+    )
+  }
+
+  const openJobDetail = async (job: Job) => {
+    try {
+      const res = await fetch(`/api/jobs/${job.id}`)
+      if (!res.ok) throw new Error('读取岗位详情失败')
+      setSelectedJob(await res.json())
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '读取岗位详情失败')
+    }
+  }
+
+  const downloadResume = (job: Job) => {
+    window.open(`/api/jobs/${job.id}/resume/download`, '_blank')
+  }
+
+  const markResumeSent = async (job: Job) => {
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/mark-resume-sent`, { method: 'POST' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '标记失败')
+      }
+      await refresh()
+      setNotice(`已标记 ${job.company}｜${job.title} 的定制简历已发送。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '标记失败')
+    }
+  }
+
+  if (loading) {
+    return <div className="flex h-full items-center justify-center text-sm text-muted">加载中...</div>
+  }
+
+  if (view === 'jobs') {
+    return <JobsPoolView updateJobStatus={updateJobStatus} />
+  }
+
+  if (view === 'monitor') {
+    return (
+      <MonitorExecutionView
+        history={history}
+        refresh={refresh}
+        refreshing={refreshing}
+        lastRefreshedAt={lastRefreshedAt}
+      />
+    )
+  }
+
+  const showGettingStarted = !Object.values(workbench.funnel).some(count => count > 0)
+  const totalPendingActionCount =
+    workbench.needs_resume.length +
+    workbench.send_errors.length +
+    pendingGreetingJobs.length +
+    todayJobs.length
+
+  return (
+    <div className="space-y-4">
+      {showGettingStarted && (
+        <GettingStartedCard
+          onCheck={runStandalonePreflight}
+          checking={preflightRunning || Boolean(modePending)}
+          notice={notice}
+          checks={preflightChecks}
+          onRetry={retryPreflight}
+        />
+      )}
+      <section id="today-workbench" className="scroll-mt-6 rounded-2xl border border-card-border bg-card p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+          <h2 className="text-lg font-bold tracking-tight">今日求职行动</h2>
+          <div className="flex items-center gap-2 text-xs text-muted">
+            <span className="mr-1 hidden sm:inline">{activeTask ? `${activeTask.label}中` : '当前空闲'}</span>
+            <Button variant="ghost" size="sm" className="h-7 px-1" onClick={runStandalonePreflight} disabled={refreshing || Boolean(modePending) || preflightRunning}>
+              <ShieldCheck className={cn('mr-1 h-3.5 w-3.5', preflightRunning && 'animate-spin')} />
+              {preflightRunning ? '预检中' : '全流程预检'}
+            </Button>
+            <Button variant="ghost" size="sm" className="h-7 px-1" onClick={refresh} disabled={refreshing} title={lastRefreshedAt ? `最后刷新：${lastRefreshedAt.toLocaleTimeString('zh-CN', { hour12: false })}` : undefined}>
+              <RefreshCw className={cn('mr-1 h-3.5 w-3.5', refreshing && 'animate-spin')} />
+              {refreshing ? '刷新中' : '刷新'}
+            </Button>
+          </div>
+        </div>
+
+        {activeTasks.length > 0 && <section aria-label="独立运行任务" className="mb-4 grid gap-3 sm:grid-cols-2">
+          {activeTasks.map(task => <article key={task.id} className={`min-w-0 rounded-xl border bg-card p-3 ${visibleTask?.id === task.id ? 'border-primary' : 'border-card-border'}`}>
+            <div className="flex items-start justify-between gap-2">
+              <button type="button" className="min-w-0 text-left" onClick={() => setFocusedTaskId(task.id)}>
+                <p className="text-sm font-bold">{[...(task.platforms || []).map(platform => PLATFORM_LABELS[platform] || platform), task.label].join(' · ')}</p>
+                <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted">{taskProgressSummary(task)}</p>
+                <p className="mt-1 text-xs text-muted">{task.status === 'stopping' ? '正在停止' : '运行中'} · 点击查看进度与日志</p>
+              </button>
+              <Button size="sm" variant="secondary" disabled={task.status === 'stopping'} onClick={() => {
+                if (!window.confirm(`停止${task.label}？其他任务继续运行，已入库数据保留。`)) return
+                void stopTask(task.id).catch(cause => setNotice(cause instanceof Error ? cause.message : '停止失败'))
+              }}>停止此任务</Button>
+            </div>
+          </article>)}
+        </section>}
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-12">
+          {modes.filter(item => item.mode === 'full').map(item => {
+            const isActive = activeTasks.some(task => task.mode === item.mode)
+            const disabled = Boolean(modePending)
+            return (
+              <button
+                key={item.mode}
+                onClick={() => {
+                  if (isActive) {
+                    void handleModeClick(item.mode)
+                    return
+                  }
+                  if (disabled) {
+                    setNotice('正在处理启动请求，请稍候。')
+                    return
+                  }
+                  setCollectDialogMode('full')
+                  setCollectDialogOpen(true)
+                }}
+                aria-disabled={disabled}
+                className={cn(
+                  'group relative flex flex-col justify-between rounded-2xl border p-5 text-left transition-all lg:col-span-5',
+                  isActive
+                    ? 'border-primary bg-primary text-primary-foreground shadow-lg shadow-primary/20'
+                    : disabled
+                      ? 'cursor-not-allowed border-card-border bg-card text-muted opacity-45'
+                      : 'border-primary/30 bg-gradient-to-br from-card via-card to-primary/5 text-foreground hover:border-primary hover:shadow-md'
+                )}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-xs">
+                      {isActive ? <Square className="h-4 w-4 fill-current" /> : <Play className="h-5 w-5 fill-current ml-0.5" />}
+                    </span>
+                    <div>
+                      <span className="inline-block rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary dark:bg-primary/20">
+                        一键托管
+                      </span>
+                      <h3 className="text-xl font-bold tracking-tight">
+                        {modePending === item.mode
+                          ? isActive ? '任务停止中' : '任务启动中'
+                          : isActive ? `${item.title}中` : item.title}
+                      </h3>
+                    </div>
+                  </div>
+                </div>
+                <p className={`mt-3 text-xs leading-relaxed ${isActive ? 'text-primary-foreground/90' : 'text-muted'}`}>
+                  {item.description}
+                </p>
+              </button>
+            )
+          })}
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:col-span-7">
+            {modes.filter(item => item.mode !== 'full').map(item => {
+              const isActive = item.mode !== 'collect' && activeTasks.some(task => task.mode === item.mode)
+              const disabled = Boolean(modePending)
+              return (
+                <button
+                  key={item.mode}
+                  onClick={() => {
+                    if (isActive) {
+                      void handleModeClick(item.mode)
+                      return
+                    }
+                    if (disabled) {
+                      setNotice('正在处理启动请求，请稍候。')
+                      return
+                    }
+                    if (item.mode === 'collect') {
+                      setCollectDialogMode('collect')
+                      setCollectDialogOpen(true)
+                    }
+                    else void handleModeClick(item.mode)
+                  }}
+                  aria-disabled={disabled}
+                  className={cn(
+                    'flex flex-col justify-between rounded-xl border p-3 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary',
+                    isActive
+                      ? 'border-primary bg-primary text-primary-foreground shadow-xs'
+                      : disabled
+                        ? 'cursor-not-allowed border-card-border bg-card text-muted opacity-45'
+                        : 'border-card-border bg-surface text-foreground hover:border-primary/50 hover:bg-secondary/40'
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-xs font-bold leading-tight">
+                      {modePending === item.mode
+                        ? isActive ? '停止中' : '启动中'
+                        : isActive ? `${item.title}中` : item.title}
+                    </span>
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center opacity-70">
+                      {isActive ? <Square className="h-2.5 w-2.5 fill-current" /> : <Play className="h-3 w-3 fill-current" />}
+                    </span>
+                  </div>
+                  <p className={`mt-1 line-clamp-1 text-[11px] leading-tight ${isActive ? 'text-primary-foreground/80' : 'text-muted'}`}>
+                    {item.description}
+                  </p>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+        {!showGettingStarted && notice && <CompactNotice message={notice} />}
+        {!showGettingStarted && preflightChecks.some(check => check.status !== 'pass') && (
+          <PreflightPanel checks={preflightChecks} checking={Boolean(modePending) || preflightRunning} onRetry={retryPreflight} />
+        )}
+        {error && <CompactNotice message={error} danger />}
+        {visibleTask && (
+          <div className="mt-3 border-t border-card-border pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-sm font-semibold">{visibleTask.label}</div>
+            <div className="flex flex-wrap items-center gap-2">
+              {(workbench.tasks?.length || 0) > 1 && <select aria-label="查看任务进度" className="max-w-64 rounded-lg border border-card-border bg-card px-2 py-1 text-xs" value={visibleTask.id} onChange={event => setFocusedTaskId(event.target.value)}>
+                {workbench.tasks?.map(task => <option key={task.id} value={task.id}>{[...(task.platforms || []).map(platform => PLATFORM_LABELS[platform] || platform), task.label, taskStatusText(task.status)].join(' · ')}</option>)}
+              </select>}
+              {['running', 'stopping'].includes(visibleTask.status) && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  disabled={visibleTask.status !== 'running'}
+                  onClick={() => {
+                    if (!window.confirm(`是否停止当前${visibleTask.label}任务？已入库数据会保留。`)) return
+                    setNotice(`正在停止${visibleTask.label}...`)
+                    void stopTask(visibleTask.id)
+                      .then(() => setNotice(`${visibleTask.label}已请求停止。`))
+                      .catch(err => setNotice(
+                        err instanceof Error
+                          ? `${visibleTask.label}停止失败：${err.message}`
+                          : `${visibleTask.label}停止失败，请稍后重试。`
+                      ))
+                  }}
+                >
+                  {visibleTask.status === 'stopping' ? '正在停止...' : '停止任务'}
+                </Button>
+              )}
+            </div>
+            </div>
+            <div className={`mt-3 rounded-xl border px-3 py-2.5 ${taskStatusClass(visibleTask.status)}`}>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs" aria-label="任务状态摘要">
+                <div className="flex shrink-0 items-center gap-2">
+                  <span className="font-semibold text-foreground">{taskStatusTitle(visibleTask.status)}</span>
+                  <span className="text-muted">{taskStatusText(visibleTask.status)}</span>
+                </div>
+                <p className="min-w-0 flex-[1_1_12rem] truncate leading-5 text-foreground" title={currentTaskStage(visibleTask)}>{currentTaskStage(visibleTask).split('\n')[0]}</p>
+                {visibleTask.metrics && (
+                  <div className="flex max-w-full flex-wrap items-center gap-x-4 gap-y-1" aria-label="任务关键统计">
+                    {taskMetricItems.filter(item => ['ai_passed', 'send_success', 'greet_generated'].includes(item.key) && item.key in visibleTask.metrics!).map(item => (
+                      <span key={item.key} className="whitespace-nowrap text-muted">{item.label} <strong className="font-semibold tabular-nums text-foreground">{visibleTask.metrics?.[item.key]}</strong></span>
+                    ))}
+                    {taskMetricItems.filter(item => !item.key.startsWith('collect_') && item.key.endsWith('_failed') && Number(visibleTask.metrics?.[item.key]) > 0).map(item => (
+                      <span key={item.key} className="whitespace-nowrap text-danger">{item.label} {visibleTask.metrics?.[item.key]}</span>
+                    ))}
+                  </div>
+                )}
+                {visibleTask.deadline_at && <span className="text-muted">截止 {new Date(visibleTask.deadline_at).toLocaleString('zh-CN', { hour12: false })}</span>}
+              </div>
+              <TaskScoringProgress task={visibleTask} />
+              {(hasStageDetails || detailMetrics.length > 0) && (
+                <details className="group mt-2 border-t border-card-border/60 pt-2 text-xs">
+                  <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-muted hover:text-foreground [&::-webkit-details-marker]:hidden">
+                    <ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" />任务详情
+                  </summary>
+                  {hasStageDetails && <p className="mt-2 whitespace-pre-line break-words leading-5 text-muted">{fullStage}</p>}
+                  {detailMetrics.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-x-4 gap-y-2" aria-label="任务详细统计">
+                      {detailMetrics.map(item => (
+                        <span key={item.key} className="text-muted">{item.label} <strong className="font-medium tabular-nums text-foreground">{visibleTask.metrics?.[item.key]}</strong></span>
+                      ))}
+                    </div>
+                  )}
+                </details>
+              )}
+              {Boolean(visibleTask.metrics?.greet_paused) && (
+                <div className="mt-2 rounded-xl border border-warning-border bg-warning-soft px-3 py-2 text-xs font-bold leading-5 text-warning-strong">
+                  提前暂停原因：{greetPauseReasonLabel(visibleTask.metrics?.greet_pause_reason) || 'AI 服务异常'}。已生成内容已保存，剩余岗位下次运行会继续处理。
+                </div>
+              )}
+            </div>
+            {visibleTask.progress?.platforms && <CollectionProgressPanel progress={visibleTask.progress} />}
+            {visibleTask.error && visibleTaskError && (
+              <div className="mt-3 rounded-2xl border border-danger-border bg-danger-soft px-4 py-3 text-sm text-danger">
+                <div className="font-black">{visibleTaskError.title}</div>
+                <p className="mt-1 text-xs leading-5">{visibleTaskError.detail}</p>
+                <details className="mt-2 text-xs text-muted">
+                  <summary className="cursor-pointer font-bold">查看原始错误</summary>
+                  <pre className="mt-2 whitespace-pre-wrap break-words rounded-lg bg-card p-2">{visibleTask.error}</pre>
+                </details>
+              </div>
+            )}
+            {visibleTask.stop_reason && (
+              <div className={`mt-3 rounded-2xl px-3 py-3 text-sm ${visibleTask.stop_reason === 'daily_limit' ? 'border border-warning-border bg-warning-soft text-warning-strong' : 'bg-secondary text-primary'}`}>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="font-black">{visibleTask.stop_reason === 'daily_limit' ? '本次未发送' : '任务说明'}</div>
+                    <div className="mt-1">{taskStopReasonLabel(visibleTask.stop_reason)}</div>
+                  </div>
+                  {visibleTask.stop_reason === 'daily_limit' && (
+                    <Button size="sm" variant="secondary" onClick={() => { window.location.href = '/config?section=throttle' }}>
+                      去设置发送额度
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      {/* 空间 B：Bento Grid 态势数据仪表盘 (3 个并排现代卡片) */}
+      <section className="space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <span className="flex h-2 w-2 rounded-full bg-primary" />
+            <h3 className="text-base font-bold tracking-tight text-foreground">态势简报</h3>
+            <span className="text-xs text-muted">实时配额、AI 战况与 7 日互动</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+          {/* Bento Card 1: ⚡ 今日投递配额 */}
+          <article className="flex flex-col justify-between rounded-2xl border border-card-border bg-card p-4 transition-all hover:border-primary/30 shadow-2xs">
+            <div>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-amber-500/10 text-amber-500 text-xs">
+                    ⚡
+                  </span>
+                  <div>
+                    <h4 className="font-bold text-sm tracking-tight text-foreground">今日投递配额</h4>
+                    <span className="text-[10px] text-muted">防风控安全节流</span>
+                  </div>
+                </div>
+                <span className={cn(
+                  'rounded-full px-2 py-0.5 text-xs font-bold tabular-nums',
+                  workbench.send_quota?.exhausted
+                    ? 'bg-danger-soft text-danger'
+                    : 'bg-primary/10 text-primary'
+                )}>
+                  {workbench.send_quota?.sent || 0} / {workbench.send_quota?.daily_limit || 0}
+                </span>
+              </div>
+
+              {/* Progress Bar */}
+              <div className="mt-4">
+                <div className="flex items-center justify-between text-xs text-muted mb-1.5">
+                  <span>投递能量柱</span>
+                  <span className="font-semibold tabular-nums text-foreground">
+                    {Math.min(100, Math.round(((workbench.send_quota?.sent || 0) / Math.max(workbench.send_quota?.daily_limit || 1, 1)) * 100))}%
+                  </span>
+                </div>
+                <div className="h-2.5 w-full overflow-hidden rounded-full bg-secondary">
+                  <div
+                    className={cn(
+                      "h-full transition-all duration-500 rounded-full",
+                      workbench.send_quota?.exhausted ? "bg-danger" : "bg-primary"
+                    )}
+                    style={{
+                      width: `${Math.min(100, Math.round(((workbench.send_quota?.sent || 0) / Math.max(workbench.send_quota?.daily_limit || 1, 1)) * 100))}%`
+                    }}
+                  />
+                </div>
+              </div>
+
+              <p className="mt-3 text-xs leading-relaxed text-muted">
+                {workbench.send_quota?.exhausted
+                  ? '今日发送额度已用完，岗位已保留在待发送列表。'
+                  : '合规防风控发送窗口正常生效中。'}
+              </p>
+            </div>
+
+            <div className="mt-4 border-t border-card-border pt-3">
+              {workbench.send_quota?.exhausted ? (
+                <Button variant="secondary" size="sm" className="w-full text-xs" onClick={() => { window.location.href = '/config?section=throttle' }}>
+                  去设置发送额度
+                </Button>
+              ) : (
+                <TopCompanies data={topCompanies} />
+              )}
+            </div>
+          </article>
+
+          {/* Bento Card 2: 🎯 AI 匹配战报 (Pipeline) */}
+          <article className="flex flex-col justify-between rounded-2xl border border-card-border bg-card p-4 transition-all hover:border-primary/30 shadow-2xs">
+            <div>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-primary/10 text-primary text-xs">
+                    🎯
+                  </span>
+                  <div>
+                    <h4 className="font-bold text-sm tracking-tight text-foreground">求职数据概览</h4>
+                    <span className="text-[10px] text-muted">全链路漏斗转化</span>
+                  </div>
+                </div>
+                <div className="inline-flex rounded-full border border-card-border bg-secondary/60 p-0.5 text-[10px]">
+                  {([
+                    { value: 'today' as const, label: '今日数据' },
+                    { value: 'total' as const, label: '累计数据' },
+                  ]).map(option => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => setStatsScope(option.value)}
+                      className={`rounded-full px-2 py-0.5 font-bold transition ${
+                        statsScope === option.value ? 'bg-primary text-primary-foreground shadow-2xs' : 'text-muted hover:text-foreground'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* 5-Stage Mini Pipeline */}
+              <div className="mt-3.5 grid grid-cols-5 gap-1 rounded-xl bg-secondary/50 p-2">
+                {statItems.map(item => {
+                  const currentValue = workbench.pending_confirmation.length
+                  const selectedFunnel = statsScope === 'today' ? workbench.funnel_today : workbench.funnel
+                  const alternateFunnel = statsScope === 'today' ? workbench.funnel : workbench.funnel_today
+                  const value = item.current ? currentValue : (selectedFunnel[item.key] || 0)
+                  const supportingText = item.current
+                    ? '实时待处理'
+                    : `${statsScope === 'today' ? '累计' : '今日'} ${alternateFunnel[item.key] || 0}`
+                  return (
+                    <div key={item.key} className="flex flex-col items-center text-center">
+                      <span className="text-[10px] text-muted truncate w-full" title={statsScope === 'today' ? item.todayLabel : item.totalLabel}>
+                        {statsScope === 'today' ? item.todayLabel.replace(/^(今日|当前)/, '') : item.totalLabel.replace(/^累计/, '')}
+                      </span>
+                      <span className={`mt-0.5 text-base font-black tabular-nums ${item.highlight ? 'text-primary' : 'text-foreground'}`}>
+                        {value}
+                      </span>
+                      <span className="text-[9px] text-muted/70 scale-90 truncate">{supportingText}</span>
+                    </div>
+                  )
+                })}
+              </div>
+
+              {/* Pipeline summary rows */}
+              <div className="mt-3 space-y-1.5 text-xs text-muted">
+                <div className="flex items-center justify-between">
+                  <span>初筛通过率</span>
+                  <span className="font-semibold text-foreground tabular-nums">
+                    {statsScope === 'today'
+                      ? (workbench.funnel_today['初筛通过'] && workbench.funnel_today['采集总数']
+                          ? `${Math.round((workbench.funnel_today['初筛通过'] / workbench.funnel_today['采集总数']) * 100)}%`
+                          : '100%')
+                      : (workbench.funnel['初筛通过'] && workbench.funnel['采集总数']
+                          ? `${Math.round((workbench.funnel['初筛通过'] / workbench.funnel['采集总数']) * 100)}%`
+                          : '100%')}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>当前待决策岗位</span>
+                  <span className="font-semibold text-primary tabular-nums">
+                    {workbench.pending_confirmation.length} 个岗位
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 border-t border-card-border pt-3">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="w-full text-xs text-muted hover:text-primary justify-center"
+                onClick={() => { window.location.href = '/jobs' }}
+              >
+                前往专属「挑岗」空间查看明细 →
+              </Button>
+            </div>
+          </article>
+
+          {/* Bento Card 3: 📈 近 7 日互动走势 (TrendChart) */}
+          <article className="flex flex-col justify-between rounded-2xl border border-card-border bg-card p-4 transition-all hover:border-primary/30 shadow-2xs">
+            <div>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-500/10 text-emerald-500 text-xs">
+                    📈
+                  </span>
+                  <div>
+                    <h4 className="font-bold text-sm tracking-tight text-foreground">近 7 日互动趋势</h4>
+                    <span className="text-[10px] text-muted">投递与查看态势</span>
+                  </div>
+                </div>
+              </div>
+              <div className="mt-2 min-h-[140px]">
+                <TrendChart data={activityData} />
+              </div>
+            </div>
+            <div className="mt-2 border-t border-card-border pt-2.5 flex items-center justify-between text-xs text-muted">
+              <span>7 日累计投递</span>
+              <span className="font-bold text-foreground">
+                {Array.isArray(activityData)
+                  ? activityData.filter(d => d.action === 'send').reduce((sum, d) => sum + (d.cnt || 0), 0)
+                  : 0} 次
+              </span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      {/* 空间 C：即刻待办卡夹 (Priority Action Deck) */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="flex h-2 w-2 rounded-full bg-primary" />
+            <h3 className="text-base font-bold tracking-tight text-foreground">即刻待办卡夹</h3>
+            <span className="text-xs text-muted">
+              {totalPendingActionCount > 0 ? `有 ${totalPendingActionCount} 项需要你决策` : '今日待办已全部清空'}
+            </span>
+          </div>
+        </div>
+
+        {workbench.needs_resume.length > 0 && (
+          <section className="rounded-2xl border border-card-border bg-card p-4 shadow-2xs">
+            <details className="group" open>
+              <summary className="flex cursor-pointer list-none items-center justify-between gap-3 py-1 text-sm [&::-webkit-details-marker]:hidden">
+                <span className="font-semibold flex items-center gap-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-md bg-info-soft text-info text-xs">📨</span>
+                  HR 简历待办 <span className="ml-1 text-xs font-normal text-muted">{workbench.needs_resume.length} 项待处理</span>
+                </span>
+                <ChevronDown className="h-4 w-4 shrink-0 text-muted transition-transform group-open:rotate-180" />
+              </summary>
+              <div className="mt-2 flex items-center justify-between gap-2 border-t border-card-border pt-2">
+                <p className="text-xs text-muted">下载后手动发给 HR，再标记已发送。</p>
+                <Button variant="ghost" size="sm" onClick={() => { window.location.href = '/monitor' }}>查看全部</Button>
+              </div>
+              <div className="divide-y divide-card-border">
+                {workbench.needs_resume.slice(0, 4).map(job => (
+                  <div key={job.id} className="flex flex-wrap items-center justify-between gap-2 py-2">
+                    <span className="flex min-w-0 flex-wrap items-center gap-2 break-words text-sm"><span>{job.company}｜{job.title}</span><OutsourcingBadge job={job} /></span>
+                    <div className="flex max-w-full flex-wrap items-center gap-1">
+                      <Button variant="ghost" size="sm" disabled={!job.url} onClick={() => window.open(job.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="mr-1 h-3.5 w-3.5" />跳转岗位链接</Button>
+                      <Button variant="ghost" size="sm" onClick={() => downloadResume(job)}><Download className="mr-1 h-3.5 w-3.5" />下载简历</Button>
+                      <Button variant="secondary" size="sm" onClick={() => markResumeSent(job)}>标记已发送</Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          </section>
+        )}
+
+        {workbench.send_errors.length > 0 && (
+          <section className="rounded-2xl border border-danger-border/70 bg-danger-soft/40 p-4 shadow-2xs">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-bold text-danger">发送失败待处理</h3>
+                <p className="mt-0.5 text-xs text-danger/80">这些岗位已生成招呼语，但没有成功发送。你可以重试，或放弃已失效岗位。</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" disabled={workbench.send_errors.some(job => sendingGreetingIds.has(job.id))} onClick={() => sendReadyGreetings(workbench.send_errors.map(job => job.id))}>
+                  {workbench.send_errors.some(job => sendingGreetingIds.has(job.id)) ? '正在重新发送...' : `重新发送全部 ${workbench.send_errors.length} 个`}
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(workbench.send_errors.map(job => job.id))}>放弃全部</Button>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+              {workbench.send_errors.map(job => (
+                <div key={job.id} className="rounded-xl border border-danger-border/80 bg-card p-3.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2 font-bold text-sm"><span>{job.company}｜{job.title}</span><OutsourcingBadge job={job} /></div>
+                      <div className="mt-1 text-xs text-danger">最近失败原因：{job.last_error || '发送失败，等待重试'}</div>
+                    </div>
+                    <span className="rounded-full bg-danger-soft px-2 py-1 text-[11px] font-black text-danger">发送失败</span>
+                  </div>
+                  <p className="mt-3 line-clamp-2 text-sm leading-6 text-muted">{job.greeting || '招呼语已生成，等待重新发送。'}</p>
+                  <div className="mt-3 flex gap-2">
+                    <Button size="sm" disabled={sendingGreetingIds.has(job.id)} onClick={() => sendReadyGreetings([job.id])}>
+                      {sendingGreetingIds.has(job.id) ? '正在重新发送...' : '重新发送'}
+                    </Button>
+                    <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs([job.id])}>放弃</Button>
+                    <Button variant="secondary" size="sm" onClick={() => openJobDetail(job)}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
+                    <Button variant="secondary" size="sm" disabled={!job.url} onClick={() => window.open(job.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="mr-2 h-4 w-4" />跳转岗位链接</Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {pendingGreetingJobs.length > 0 && (
+          <section className="rounded-2xl border border-card-border bg-card p-4 shadow-2xs">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold flex items-center gap-2">
+                  <span className="flex h-6 w-6 items-center justify-center rounded-md bg-warning-soft text-warning text-xs">💬</span>
+                  待发送招呼语 <span className="ml-1 text-xs font-normal text-muted">{pendingGreetingJobs.length} 条</span>
+                </h3>
+                <p className="mt-1 text-xs text-muted">选择只保存版本，发送需另行确认。</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {pendingGreetingReviewCount > 0 && (
+                  <span className="rounded-full bg-warning-soft px-2 py-1 text-xs font-medium text-warning">
+                    {pendingGreetingReviewCount} 个待选择
+                  </span>
+                )}
+                <Button
+                  size="sm"
+                  disabled={reviewedGreetingJobs.length === 0 || reviewedGreetingJobs.some(job => sendingGreetingIds.has(job.id) || busyGreetingIds.has(job.id) || Boolean(job.greeting_activity))}
+                  onClick={() => sendReadyGreetings(reviewedGreetingJobs.map(job => job.id))}
+                >
+                  发送已确认 {reviewedGreetingJobs.length} 个
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(pendingGreetingJobs.map(job => job.id))}>放弃全部</Button>
+              </div>
+            </div>
+            <div className="divide-y divide-card-border border-t border-card-border">
+              {pendingGreetingJobs.map(job => (
+                <GreetingReviewCard
+                  key={job.id}
+                  job={job}
+                  busy={sendingGreetingIds.has(job.id) || Boolean(job.greeting_activity)}
+                  onBusyChange={onGreetingBusyChange}
+                  onSelect={(selection, greeting) => selectGreeting(job, selection, greeting)}
+                  onSend={() => sendReadyGreetings([job.id])}
+                  onReject={() => rejectSelectedJobs([job.id])}
+                  onDetail={() => openJobDetail(job)}
+                />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* 待确认岗位引导与优先决策卡片（核心：告别长列表堆叠） */}
+        {filteredTodayJobs.length > 0 && (
+          <section className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-2xl border border-primary/25 bg-gradient-to-r from-primary/5 via-card to-card p-4 transition-all shadow-2xs">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-xs">
+                  <Sparkles className="h-5 w-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-bold tracking-tight text-foreground">
+                      发现 {filteredTodayJobs.length} 个新匹配岗位待确认
+                    </h3>
+                    <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-bold text-primary">
+                      待决断
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-xs text-muted">
+                    AI 已完成评分与硬性要求比对。推荐前往专属「挑岗」页面体验 3D 沉浸决策，或直接在此一键投递。
+                  </p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={() => { window.location.href = '/jobs' }}
+                  className="shadow-xs font-semibold"
+                >
+                  进入「挑岗」沉浸决断 ({filteredTodayJobs.length}) →
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!actionableSelected.length}
+                  onClick={() => setBatchDeliverySelection([...actionableSelected])}
+                >
+                  一键投递已选 ({actionableSelected.length})
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setBatchDeliverySelection([])}
+                >
+                  管理招呼搭配
+                </Button>
+              </div>
+            </div>
+
+            {/* 默认折叠：可就地展开速览，绝不大屏铺开 */}
+            <details className="group rounded-2xl border border-card-border bg-card p-4">
+              <summary className="cursor-pointer list-none flex-wrap items-center justify-between gap-3 [&::-webkit-details-marker]:hidden flex">
+                <div>
+                  <h4 className="text-sm font-bold tracking-tight text-foreground flex items-center gap-1.5">
+                    <ChevronDown className="h-4 w-4 text-muted transition-transform group-open:rotate-180" />
+                    今日待确认明细（就地快捷速审）
+                    <span className="ml-2 text-xs font-normal text-muted">{filteredTodayJobs.length} 个岗位</span>
+                  </h4>
+                  <p className="mt-0.5 text-xs text-muted">展开可在当前页直接浏览并操作，未展开时保持驾驶舱极简通透。</p>
+                </div>
+                <div className="flex flex-wrap gap-2" onClick={e => e.stopPropagation()}>
+                  <Button variant="secondary" size="sm" disabled={!filteredTodayJobs.length} onClick={() => setSelected(filteredTodayJobs.map(job => job.id))}>全选</Button>
+                  <Button variant="secondary" size="sm" disabled={!selected.length} onClick={() => setSelected([])}>清空</Button>
+                  <Button variant="secondary" size="sm" disabled={generatingGreetings || greetTaskRunning || !actionableSelected.length} onClick={() => generateGreetings(actionableSelected)}>
+                    {generatingGreetings || greetTaskRunning ? '生成中...' : `生成打招呼用语 ${actionableSelected.length} 个`}
+                  </Button>
+                  <Button variant="secondary" size="sm" disabled={!actionableSelected.length} onClick={() => rejectSelectedJobs(actionableSelected)}>放弃已选 {actionableSelected.length} 个</Button>
+                </div>
+              </summary>
+              <div className="mt-3 border-t border-card-border pt-3">
+                <JobFilterBar
+                  compact
+                  filters={todayFilters}
+                  onChange={setTodayFilters}
+                  onReset={() => setTodayFilters({ ...EMPTY_JOB_FILTERS })}
+                  resultCount={filteredTodayJobs.length}
+                  totalCount={todayJobs.length}
+                  invalidSalary={hasInvalidSalaryRange(todayFilters)}
+                  cityOptions={todayCityOptions}
+                />
+                {filteredTodayJobs.length ? (
+                  <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-2 max-h-[600px] overflow-y-auto pr-1">
+                    {filteredTodayJobs.map(job => (
+                      <JobActionCard
+                        key={job.id}
+                        job={job}
+                        selected={selected.includes(job.id)}
+                        onToggle={() => toggleJob(job.id)}
+                        onDetail={() => openJobDetail(job)}
+                        onReject={() => rejectSelectedJobs([job.id])}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="mt-3 rounded-2xl border border-dashed border-card-border bg-surface p-5 text-center text-sm text-muted">
+                    <p>没有符合当前条件的岗位</p>
+                    <Button className="mt-3" variant="secondary" size="sm" onClick={() => setTodayFilters({ ...EMPTY_JOB_FILTERS })}>重置筛选</Button>
+                  </div>
+                )}
+              </div>
+            </details>
+          </section>
+        )}
+
+        {/* 今日待办已全部清空，系统静默值守 */}
+        {totalPendingActionCount === 0 && (
+          <div className="rounded-2xl border border-dashed border-card-border bg-card/60 p-8 text-center backdrop-blur-xs">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/10 text-emerald-500">
+              <Sparkles className="h-6 w-6" />
+            </div>
+            <h4 className="mt-3 text-base font-bold text-foreground">🎉 今日待办已全部清空，自动化系统静默值守中</h4>
+            <p className="mt-1 text-xs text-muted max-w-md mx-auto leading-relaxed">
+              当前没有待决断岗位、待发送简历或异常事项。系统正根据你的偏好规则持续监控全网动态。
+            </p>
+            <div className="mt-4 flex items-center justify-center gap-3">
+              <Button variant="secondary" size="sm" onClick={() => { window.location.href = '/jobs' }}>浏览岗位库</Button>
+              <Button variant="secondary" size="sm" onClick={() => { window.location.href = '/subscription' }}>查看搜集雷达</Button>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {selectedJob && <JobDetailModal job={selectedJob} onClose={() => setSelectedJob(null)} onChanged={() => void refresh()} />}
+      <CollectJobsDialog
+        open={collectDialogOpen}
+        mode={collectDialogMode}
+        activeTask={null} activeTasks={activeTasks}
+        onClose={() => setCollectDialogOpen(false)}
+        onStart={startCollection}
+      />
+      <DeliveryDialog open={batchDeliverySelection !== null} count={batchDeliverySelection?.length || 0} jobIds={batchDeliverySelection || []} onClose={() => setBatchDeliverySelection(null)} onConfirm={confirmDeliver} />
+    </div>
+  )
+}
+
+function collectionReasonLabel(reason = '') {
+  if (reason.includes('daily_detail_page_limit')) return '今日详情页次数已用完'
+  if (reason.includes('daily_platform_page_limit')) return '今日页面访问次数已用完'
+  if (reason.includes('daily_search_page_limit')) return '今日搜索页次数已用完'
+  return ''
+}
+
+function CollectionProgressPanel({ progress }: { progress: CollectionProgress }) {
+  const outcome = ({ running: '采集中', scoring: '正在评分', completed: '已完成', completed_with_shortage: '采集已结束，数量不足', completed_with_errors: '采集结束，有异常', failed: '采集失败', stopped: '已停止', cancelled: '已取消' } as Record<string, string>)[progress.outcome || ''] || '状态待确认'
+  const platforms = Object.entries(progress.platforms || {})
+  return (
+    <details className="group mt-2 rounded-xl border border-card-border bg-card px-3 py-2 text-xs">
+      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-3 gap-y-1 [&::-webkit-details-marker]:hidden">
+        <span className="flex items-center gap-1.5 font-semibold"><ChevronDown className="h-3.5 w-3.5 text-muted transition-transform group-open:rotate-180" />采集详情</span>
+        <span className="text-muted">{outcome}</span>
+        {platforms.map(([platform, state]) => (
+          <span key={platform} className="text-muted">{PLATFORM_LABELS[platform] || platform} · 新增 {state.new || 0} 条
+            {collectionReasonLabel(`${state.reason_code || ''} ${state.message || ''}`) && <span className="ml-2 text-warning">{collectionReasonLabel(`${state.reason_code || ''} ${state.message || ''}`)}</span>}
+          </span>
+        ))}
+      </summary>
+      <div className="mt-2 divide-y divide-card-border border-t border-card-border">
+        {platforms.map(([platform, state]) => (
+          <div key={platform} className="py-2 leading-5">
+            <div className="flex flex-wrap justify-between gap-x-3">
+              <span className="font-medium">{PLATFORM_LABELS[platform] || platform}</span>
+              <span className="text-muted">{state.status === 'queued' ? '等待前序平台完成' : `${state.city || '城市未开始'} · ${state.keyword || '关键词未开始'} · 第 ${state.page || 0}/${state.max_pages || 0} 页`}</span>
+            </div>
+            <p className="text-muted">扫描 {state.seen || 0} · 新增 {state.new} · 重复 {state.duplicate || 0} · 过滤 {state.filtered || 0} · 解析失败 {state.parse_failed || 0} · 保存失败 {state.save_failed || 0}</p>
+            {Number(state.filtered) > 0 && (
+              <details className="mt-2 rounded-lg border border-card-border bg-secondary/40 p-2" open>
+                <summary className="cursor-pointer font-medium">过滤记录 · {state.filtered} 条</summary>
+                <p className="mt-1 text-xs text-muted">这里展示本次采集最近 200 条记录；过滤岗位保存在过滤库，不计入全部岗位。</p>
+                {state.filter_records?.length ? (
+                  <>
+                    <p className="text-xs text-muted">已保留 {state.filter_records.length} 条{state.filter_records.length < Number(state.filtered) ? '，其余记录未保留或来自旧版采集' : ''}</p>
+                    <ol tabIndex={0} aria-label={`${PLATFORM_LABELS[platform] || platform}过滤记录`} className="mt-2 max-h-60 space-y-2 overflow-y-auto overscroll-contain pr-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
+                      {state.filter_records.map((record, index) => (
+                        <li key={`${record.source_job_id}-${index}`} className="rounded-md bg-card p-2">
+                          <p className="break-words font-medium">{record.title || '职位名称未提供'} · {record.company || '公司名称未提供'}</p>
+                          <p className="break-words text-muted">{record.reason}</p>
+                        </li>
+                      ))}
+                    </ol>
+                  </>
+                ) : <p className="mt-2 text-muted">本次采集未保存过滤明细，旧记录无法补回；新版本启动的采集会记录原因。</p>}
+              </details>
+            )}
+            {(Number(state.parse_failed || 0) + Number(state.save_failed || 0)) > 0 && (
+              <details open className="mt-2 rounded-lg border border-danger-border bg-danger-soft p-2">
+                <summary className="cursor-pointer font-medium text-danger">采集异常记录 · {(state.parse_failed || 0) + (state.save_failed || 0)} 次</summary>
+                <p className="mt-1 text-xs text-muted">每个平台保留本次采集最近 200 条异常；已保留 {state.error_records?.length || 0} 条。</p>
+                {state.error_records?.length ? (
+                  <ol tabIndex={0} aria-label={`${PLATFORM_LABELS[platform] || platform}采集异常记录`} className="mt-2 max-h-60 space-y-2 overflow-y-auto overscroll-contain pr-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
+                    {state.error_records.map((record, index) => (
+                      <li key={index} className="rounded-md bg-card p-2">
+                        <p className="font-medium text-danger">{record.kind === 'save' ? '保存失败' : '解析失败'}</p>
+                        {record.title && <p className="break-words">{record.title}{record.company ? ` · ${record.company}` : ''}</p>}
+                        <p className="break-words text-muted">{[record.city, record.keyword, record.page ? `第 ${record.page} 页` : ''].filter(Boolean).join(' · ') || '未取得页面上下文'}</p>
+                        <p className="break-words">{record.reason}</p>
+                      </li>
+                    ))}
+                  </ol>
+                ) : <p className="mt-2 text-muted">本次采集未保存异常明细，旧记录无法补回。</p>}
+              </details>
+            )}
+            {(state.message || state.reason_code) && !state.filter_records?.some(record => record.reason === state.message) && !state.error_records?.some(record => record.reason === state.message) && <p className="mt-1 break-words text-muted">{state.message?.replace(/；本轮新增 \d+ 条，读取 \d+ 条，重复 \d+ 条，过滤 \d+ 条，解析失败 \d+ 条，保存失败 \d+ 条$/, '') || state.reason_code}</p>}
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function GreetingReviewCard({
+  job,
+  busy = false,
+  onBusyChange,
+  onSelect,
+  onSend,
+  onReject,
+  onDetail,
+}: {
+  job: Job
+  busy?: boolean
+  onBusyChange?: (id: string, busy: boolean) => void
+  onSelect: (selection: 'original' | 'optimized' | 'edited', greeting?: string) => Promise<void>
+  onSend: () => void
+  onReject: () => void
+  onDetail: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(job.greeting || '')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    onBusyChange?.(job.id, editing || saving)
+    return () => onBusyChange?.(job.id, false)
+  }, [job.id, editing, saving, onBusyChange])
+  const original = job.greeting_original || job.greeting || ''
+  const optimized = job.greeting_optimized || ''
+  const hasPreview = Boolean(optimized && optimized !== original)
+  const needsSelection = job.greeting_selection === 'pending'
+  const issues = Array.isArray(job.greeting_style_issues) ? job.greeting_style_issues : []
+  const selectionLabel = needsSelection
+    ? '待选择'
+    : job.greeting_selection === 'auto_optimized'
+      ? '已自动采用，可调整'
+      : job.greeting_reviewed_at
+        ? '已人工确认'
+        : '待发送'
+
+  const saveSelection = async (selection: 'original' | 'optimized' | 'edited', greeting = '') => {
+    setSaving(true)
+    setError('')
+    try {
+      await onSelect(selection, greeting)
+      setEditing(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="py-2.5">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-controls={`greeting-review-${job.id}`}
+        aria-label={`${expanded ? '收起' : '展开'}招呼语：${job.company}｜${job.title}`}
+        disabled={editing || saving}
+        onClick={() => setExpanded(value => !value)}
+        className="w-full rounded-lg text-left outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default"
+      >
+        <span className="flex items-center gap-2">
+          <span className={`min-w-0 flex-1 text-sm font-medium ${expanded ? 'break-words' : 'truncate'}`}>{job.company}｜{job.title}</span>
+          <OutsourcingBadge job={job} />
+          <span className={`shrink-0 rounded px-1.5 py-0.5 text-xs ${needsSelection ? 'bg-warning-soft text-warning' : 'text-muted'}`}>{selectionLabel}</span>
+          <ChevronDown className={`h-4 w-4 shrink-0 text-muted transition-transform ${expanded ? 'rotate-180' : ''}`} />
+        </span>
+        {!expanded && <span className="mt-1 block truncate text-xs leading-5 text-muted">{job.greeting || original || '展开查看招呼语'}</span>}
+      </button>
+      {job.greeting_activity && (
+        <p className="mt-1 text-xs text-muted" role="status">
+          {job.greeting_activity === 'sending' ? '这条正在发送，暂不可修改。'
+            : job.greeting_activity === 'generating' ? '这条正在生成，完成后即可选择。'
+              : '这条正在保存，请稍后。'}
+        </p>
+      )}
+      {expanded && <div id={`greeting-review-${job.id}`}>
+
+        {issues.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted" aria-label="招呼语优化原因">
+            {issues.map(issue => (
+              <span key={issue} className="leading-5">
+                {issue}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {hasPreview ? (
+          <div className="mt-2 grid gap-2 md:grid-cols-2">
+            <div className={`rounded-xl border p-3 ${job.greeting_selection === 'original' || needsSelection ? 'border-card-border bg-surface' : 'border-card-border/70 bg-card'}`}>
+              <div className="text-[11px] font-semibold text-muted">原始版本</div>
+              <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">{original}</p>
+              <Button className="mt-3" variant="secondary" size="sm" disabled={saving || busy} onClick={() => void saveSelection('original')}>
+                保留原文
+              </Button>
+            </div>
+            <div className={`rounded-xl border p-3 ${job.greeting_selection === 'optimized' || job.greeting_selection === 'auto_optimized' ? 'border-primary/30 bg-surface-muted' : 'border-primary/20 bg-card'}`}>
+              <div className="flex items-center gap-1.5 text-[11px] font-semibold text-primary">
+                <Sparkles className="h-3.5 w-3.5" />优化预览
+              </div>
+              <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">{optimized}</p>
+              <Button className="mt-3" size="sm" disabled={saving || busy} onClick={() => void saveSelection('optimized')}>
+                采用优化版
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-3 rounded-xl border border-card-border bg-surface p-3">
+            <div className="text-[11px] font-semibold text-muted">当前版本</div>
+            <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">{job.greeting || '招呼语已生成，等待发送。'}</p>
+          </div>
+        )}
+
+        {hasPreview && !needsSelection && (
+          <div className="mt-3 rounded-xl border border-primary/30 bg-surface-muted p-3" aria-label="最终发送版本">
+            <div className="text-[11px] font-semibold text-primary">最终发送版本</div>
+            <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-foreground">{job.greeting}</p>
+          </div>
+        )}
+
+        {editing && (
+          <div className="mt-3 rounded-xl border border-card-border bg-surface p-3">
+            <label className="text-xs font-black text-foreground" htmlFor={`greeting-edit-${job.id}`}>手动编辑最终版本</label>
+            <textarea
+              id={`greeting-edit-${job.id}`}
+              value={draft}
+              maxLength={300}
+              onChange={event => setDraft(event.target.value)}
+              className="mt-2 min-h-28 w-full resize-y rounded-xl border border-card-border bg-card p-3 text-sm leading-6 outline-none focus:border-primary"
+            />
+            <div className="mt-2 flex items-center justify-between gap-3">
+              <span className="text-xs text-muted">{draft.length}/300</span>
+              <div className="flex gap-2">
+                <Button variant="secondary" size="sm" disabled={saving} onClick={() => setEditing(false)}>取消</Button>
+                <Button size="sm" disabled={saving || busy || !draft.trim()} onClick={() => void saveSelection('edited', draft)}>保存编辑版</Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 rounded-lg bg-danger-soft px-3 py-2 text-xs font-bold text-danger">{error}</p>}
+
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="sm" disabled={needsSelection || editing || saving || busy} onClick={onSend}>发送招呼语</Button>
+          <Button variant="secondary" size="sm" disabled={saving || busy} onClick={() => { setDraft(job.greeting || original); setEditing(true) }}>
+            <Pencil className="mr-2 h-4 w-4" />手动编辑
+          </Button>
+          <Button variant="ghost" size="sm" onClick={onDetail}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
+          <Button variant="ghost" size="sm" disabled={saving || busy} onClick={onReject}>放弃</Button>
+        </div>
+      </div>}
+    </div>
+  )
+}
+
+function JobActionCard({ job, selected, onToggle, onDetail, onReject }: { job: Job; selected: boolean; onToggle: () => void; onDetail: () => void; onReject: () => void }) {
+  return (
+    <div className={`rounded-2xl border p-4 ${selected ? 'border-primary bg-surface' : 'border-card-border bg-surface'}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex flex-wrap items-center gap-2 font-black"><span>{job.company}｜{job.title}</span><OutsourcingBadge job={job} /></div>
+          <div className="mt-1 text-xs text-muted">{jobSubtitle(job)}</div>
+        </div>
+        <input type="checkbox" checked={selected} onChange={onToggle} className="mt-1 h-4 w-4 accent-primary" />
+      </div>
+      <p className="mt-3 line-clamp-2 text-sm leading-6 text-muted">{job.score_reason || job.greeting || '等待继续推进。'}</p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Button variant="secondary" size="sm" onClick={onDetail}><Eye className="mr-2 h-4 w-4" />查看详情</Button>
+        <Button variant="secondary" size="sm" disabled={!job.url} onClick={() => window.open(job.url, '_blank', 'noopener,noreferrer')}><ExternalLink className="mr-2 h-4 w-4" />跳转岗位链接</Button>
+        <Button variant="secondary" size="sm" onClick={onReject}><XCircle className="mr-2 h-4 w-4" />放弃岗位</Button>
+      </div>
+    </div>
+  )
+}
+
+function JobDetailModal({ job, onClose, onChanged }: { job: Job; onClose: () => void; onChanged?: () => void }) {
+  const [greeting, setGreeting] = useState(job.greeting || '')
+  const [savedGreeting, setSavedGreeting] = useState(job.greeting || '')
+  const [editing, setEditing] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [regenerating, setRegenerating] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [reviewed, setReviewed] = useState(Boolean(job.greeting_reviewed_at))
+  const [selectionPending, setSelectionPending] = useState(job.greeting_selection === 'pending')
+
+  const saveGreeting = async () => {
+    const text = greeting.trim()
+    if (!text) {
+      setNotice('招呼语不能为空')
+      return
+    }
+    setSaving(true)
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/greeting`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ greeting: text, confirmed: true }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '保存失败')
+      }
+      setEditing(false)
+      setSavedGreeting(text)
+      setReviewed(true)
+      setSelectionPending(false)
+      setNotice('最终发送版本已确认，后台生成不会覆盖。')
+      onChanged?.()
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const regenerateGreeting = async () => {
+    setRegenerating(true)
+    setNotice('')
+    try {
+      const res = await fetch('/api/workbench/greetings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_ids: [job.id], regenerate: true }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.error || '重新生成失败')
+      }
+      const taskId = data.task?.id
+      const finished = taskId ? await waitForGreetTask(taskId) : null
+      if (!finished) {
+        const detailRes = await fetch(`/api/jobs/${job.id}`)
+        if (detailRes.ok) {
+          const detail = await detailRes.json()
+          setGreeting(detail.greeting || '')
+          setSavedGreeting(detail.greeting || '')
+          setReviewed(Boolean(detail.greeting_reviewed_at))
+          setSelectionPending(detail.greeting_selection === 'pending')
+        }
+        onChanged?.()
+        setNotice('生成时间较长，任务仍在后台运行，稍后刷新查看结果。')
+        return
+      }
+      if (finished.status === 'stopped') {
+        throw new Error('重新生成已停止，岗位保留原有招呼语')
+      }
+      if (finished.status === 'failed') {
+        throw new Error(finished.error ? `重新生成失败：${finished.error}` : '重新生成失败')
+      }
+      if ((finished.progress?.conflict_ids ?? []).includes(job.id)) {
+        throw new Error('岗位状态已变更，招呼语未保存，请刷新后重试')
+      }
+      if (!finished.metrics?.greet_generated) {
+        throw new Error('AI 未返回完整招呼语，岗位保留为待生成，可稍后重试')
+      }
+      const detailRes = await fetch(`/api/jobs/${job.id}`)
+      if (detailRes.ok) {
+        const detail = await detailRes.json()
+        setGreeting(detail.greeting || '')
+        setSavedGreeting(detail.greeting || '')
+        setReviewed(Boolean(detail.greeting_reviewed_at))
+        setSelectionPending(detail.greeting_selection === 'pending')
+      }
+      setNotice('已重新生成招呼语')
+      onChanged?.()
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '重新生成失败')
+    } finally {
+      setRegenerating(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-6">
+      <div className="max-h-[86vh] w-full max-w-3xl overflow-y-auto rounded-3xl border border-card-border bg-card p-6 shadow-2xl">
+        <div className="mb-4 flex items-start justify-between gap-4">
+          <div>
+            <div className="text-xs font-black tracking-[0.18em] text-primary">岗位详情</div>
+            <h3 className="mt-1 flex flex-wrap items-center gap-2 text-2xl font-bold tracking-tight text-foreground"><span>{job.company}｜{job.title}</span><OutsourcingBadge job={job} /></h3>
+            <p className="mt-1 text-sm text-muted">{job.salary || '薪资未填'} · {job.city || '城市未填'} · {getStatusLabel(job.status)}</p>
+          </div>
+          <Button variant="secondary" size="sm" onClick={onClose}>关闭</Button>
+        </div>
+        <InterviewPreparation key={job.id} job={job} />
+        <div className="grid gap-3 text-sm lg:grid-cols-2">
+          <InfoBlock label="HR" value={[job.hr_name, job.hr_title].filter(Boolean).join(' · ') || '-'} />
+          <InfoBlock label="招聘者活跃" value={job.hr_active || '活跃度未知'} />
+          <InfoBlock label="公司" value={[job.company_size, job.company_industry].filter(Boolean).join(' · ') || '-'} />
+          <InfoBlock label="来源平台" value={job.source_platform && job.source_platform !== 'boss' && PLATFORM_LABELS[job.source_platform] ? `${PLATFORM_LABELS[job.source_platform]}｜当前只开放采集` : 'BOSS 直聘'} />
+          <InfoBlock label="匹配分" value={String(job.score || '-')} />
+          <InfoBlock label="定制简历" value={job.resume_path || '未生成'} />
+        </div>
+        <div className="mt-4 rounded-2xl border border-card-border bg-surface p-4">
+          <div className="text-sm font-black">评分理由</div>
+          <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{job.score_reason || '-'}</p>
+        </div>
+        <div className="mt-4 rounded-2xl border border-card-border bg-surface p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-sm font-black">招呼语</div>
+            <div className="flex gap-2">
+              {editing ? (
+                <>
+                  <Button size="sm" disabled={saving} onClick={saveGreeting}>{saving ? '保存中...' : '保存'}</Button>
+                  <Button size="sm" variant="secondary" disabled={saving} onClick={() => { setEditing(false); setGreeting(savedGreeting) }}>取消</Button>
+                </>
+              ) : (
+                <>
+                  <Button size="sm" variant="secondary" disabled={regenerating} onClick={() => { setEditing(true); setNotice('') }}>编辑</Button>
+                  <Button size="sm" variant="secondary" disabled={regenerating || reviewed} onClick={regenerateGreeting}>
+                    {regenerating ? '生成中...' : 'AI 重新生成'}
+                  </Button>
+                </>
+              )}
+            </div>
+          </div>
+          {reviewed && <p className="mt-2 text-xs text-muted">最终发送版本已人工确认；如需调整，请手动编辑。</p>}
+          {selectionPending && <p className="mt-2 text-xs text-warning">已有优化预览，请返回待发送列表选择最终版本，或手动编辑并保存。</p>}
+          {editing ? (
+            <textarea
+              className="mt-2 w-full rounded-xl border border-card-border bg-card p-3 text-sm leading-6 text-foreground focus:border-primary focus:outline-none"
+              rows={4}
+              maxLength={300}
+              value={greeting}
+              onChange={e => setGreeting(e.target.value)}
+            />
+          ) : (
+            <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{greeting || '未生成'}</p>
+          )}
+          {notice && <div className="mt-2 text-xs font-bold text-primary">{notice}</div>}
+        </div>
+        <div className="mt-4 rounded-2xl border border-card-border bg-surface p-4">
+          <div className="text-sm font-black">JD</div>
+          <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{job.jd || '-'}</p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function InfoBlock({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-2xl border border-card-border bg-surface p-4">
+      <div className="text-xs text-muted">{label}</div>
+      <div className="mt-1 font-bold text-foreground">{value}</div>
+    </div>
+  )
+}
+
+const SENT_LIBRARY_STATUSES = ['sent', 'replied', 'resume_sent', 'needs_resume', 'follow_up_sent']
+
+function JobsPoolView({ updateJobStatus }: { updateJobStatus: (jobId: string, status: string) => Promise<void> }) {
+  const pageSize = 15
+  const [page, setPage] = useState(0)
+  const [filters, setFilters] = useState<JobFilters>({ ...EMPTY_JOB_FILTERS })
+  const [library, setLibrary] = useState<'all' | 'filtered' | 'sent'>('all')
+  const [companyLibrary, setCompanyLibrary] = useState(false)
+  const [poolMode, setPoolMode] = useState<'table' | 'swipe'>('table')
+  const [swipeContext, setSwipeContext] = useState<{
+    initialJobId: string
+    initialJobs: Job[]
+    initialIndex: number
+    initialPage: number
+  } | null>(null)
+  const inSentLibrary = library === 'sent'
+  const inFilteredLibrary = library === 'filtered'
+  const inCampusLibrary = library === 'all' && filters.recruitmentType.length === 1 && filters.recruitmentType[0] === 'campus'
+  const inSocialLibrary = library === 'all' && filters.recruitmentType.length === 1 && filters.recruitmentType[0] === 'experienced'
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [notice, setNotice] = useState('')
+  const [blockedCompanies, setBlockedCompanies] = useState<string[]>([])
+  const [blockingJobId, setBlockingJobId] = useState<string | null>(null)
+  const blockingCompanyRef = useRef(false)
+  const [showRecycleBin, setShowRecycleBin] = useState(false)
+  const [showScoreDialog, setShowScoreDialog] = useState(false)
+  const [showDeliveryDialog, setShowDeliveryDialog] = useState(false)
+  const [deliverySelection, setDeliverySelection] = useState<string[]>([])
+  const [quickScoring, setQuickScoring] = useState(false)
+  const [sortBy, setSortBy] = useState<JobSortKey>('created_at')
+  const [sortOrder, setSortOrder] = useState<JobSortOrder>('desc')
+  const [recycleJobs, setRecycleJobs] = useState<Job[]>([])
+  const [recycleSelectedIds, setRecycleSelectedIds] = useState<string[]>([])
+  const [recycleLoading, setRecycleLoading] = useState(false)
+  const [permanentDeleteIds, setPermanentDeleteIds] = useState<string[]>([])
+  const [permanentDeleteAcknowledged, setPermanentDeleteAcknowledged] = useState(false)
+  const { items, total, allTotal, cityOptions, titleOptions, loading, error, lastRefreshedAt: jobsRefreshedAt, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder, library)
+  const { workbench: deliveryWorkbench, error: progressError, refresh: refreshWorkbench } = useDashboard('workbench')
+  const deliveryTask = [...(deliveryWorkbench.tasks || [deliveryWorkbench.task, deliveryWorkbench.last_task].filter(Boolean) as WorkbenchTask[])].reverse().find(task => task.mode === 'deliver' || (task.mode === 'full' && task.metrics?.send_attempted !== undefined)) || null
+  const scoreTasks = (deliveryWorkbench.active_tasks || (deliveryWorkbench.task ? [deliveryWorkbench.task] : []))
+    .filter(task => task.mode === 'score' || task.mode === 'rescore' || task.metrics?.ai_total !== undefined)
+  const lastScoreTask = [...(deliveryWorkbench.tasks || [deliveryWorkbench.last_task].filter(Boolean) as WorkbenchTask[])].reverse()
+    .find(task => task.mode === 'score' || task.mode === 'rescore' || task.metrics?.ai_total !== undefined)
+  const visibleScoreTasks = scoreTasks.length ? scoreTasks : lastScoreTask ? [lastScoreTask] : []
+
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const loadBlockedCompanies = () => {
+      fetch('/api/agent/state', { cache: 'no-store', signal: controller.signal })
+        .then(async res => {
+          if (!res.ok) return
+          const data = await res.json()
+          if (!controller.signal.aborted && Array.isArray(data.preferences?.blocked_companies)) {
+            setBlockedCompanies(data.preferences.blocked_companies)
+          }
+        })
+        .catch(() => { /* 点击屏蔽时会重新读取，并显示读取错误。 */ })
+    }
+    loadBlockedCompanies()
+    const handleConfigSaved = () => {
+      loadBlockedCompanies()
+      setSelectedIds([])
+      setPage(0)
+      refreshJobs()
+    }
+    window.addEventListener('bosshunter-config-saved', handleConfigSaved)
+    return () => {
+      controller.abort()
+      window.removeEventListener('bosshunter-config-saved', handleConfigSaved)
+    }
+  }, [refreshJobs])
+
+  useEffect(() => {
+    setPage(0)
+    setSelectedIds([])
+  }, [filters, library])
+
+  const toggleSelected = (jobId: string) => {
+    setSelectedIds(previous => previous.includes(jobId) ? previous.filter(id => id !== jobId) : [...previous, jobId])
+  }
+
+  const allPageSelected = items.length > 0 && items.every(job => selectedIds.includes(job.id))
+  const toggleCurrentPage = () => {
+    const pageIds = new Set(items.map(job => job.id))
+    setSelectedIds(previous => allPageSelected
+      ? previous.filter(id => !pageIds.has(id))
+      : [...new Set([...previous, ...pageIds])])
+  }
+
+  const changeSort = (nextSortBy: JobSortKey) => {
+    setPage(0)
+    if (nextSortBy === sortBy) {
+      setSortOrder(previous => previous === 'asc' ? 'desc' : 'asc')
+      return
+    }
+    setSortBy(nextSortBy)
+    setSortOrder(nextSortBy === 'score' || nextSortBy === 'created_at' ? 'desc' : 'asc')
+  }
+
+  const loadRecycleBin = async () => {
+    setRecycleLoading(true)
+    try {
+      const collected: Job[] = []
+      let offset = 0
+      const limit = 200
+      while (true) {
+        const res = await fetch(`/api/jobs?deleted=only&limit=${limit}&offset=${offset}`, { cache: 'no-store' })
+        if (!res.ok) throw new Error(`回收站接口返回 ${res.status}`)
+        const pageItems = await res.json()
+        if (!Array.isArray(pageItems)) throw new Error('回收站响应格式无效')
+        collected.push(...pageItems)
+        const totalCount = Number(res.headers.get('X-Total-Count'))
+        if (!pageItems.length || pageItems.length < limit || (Number.isFinite(totalCount) && collected.length >= totalCount)) break
+        offset += pageItems.length
+      }
+      const unique = new Map(collected.map(job => [String(job.id), job]))
+      setRecycleJobs([...unique.values()])
+      setRecycleSelectedIds(previous => previous.filter(id => unique.has(id)))
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '读取回收站失败')
+    } finally {
+      setRecycleLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadRecycleBin()
+  }, [])
+
+  const postJobAction = async (path: string, payload: Record<string, unknown>) => {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      const blocked = Array.isArray(data.blocked)
+        ? data.blocked.map((item: { job_id?: string; reasons?: string[] }) => `${item.job_id || '岗位'}：${(item.reasons || []).join('、')}`).join('；')
+        : ''
+      throw new Error([data.error || '岗位操作失败', blocked].filter(Boolean).join('；'))
+    }
+    return res.json()
+  }
+
+  const softDelete = async (jobIds: string[]) => {
+    if (!jobIds.length || !window.confirm(`确认将 ${jobIds.length} 个岗位移入回收站吗？岗位不会永久删除。`)) return
+    try {
+      const result = await postJobAction('/api/jobs/soft-delete', { job_ids: jobIds, confirmed: true })
+      setSelectedIds(previous => previous.filter(id => !jobIds.includes(id)))
+      refreshJobs()
+      await loadRecycleBin()
+      setNotice(`已移入回收站 ${result.affected_count || 0} 条岗位。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '移入回收站失败')
+    }
+  }
+
+  const blockCompany = async (job: Job) => {
+    const company = (job.company || '').trim()
+    if (!company || blockingCompanyRef.current) return
+    blockingCompanyRef.current = true
+    setBlockingJobId(job.id)
+    setNotice('正在读取屏蔽名单并准备配置预览…')
+    try {
+      const readRules = async (): Promise<string[]> => {
+        const res = await fetch('/api/agent/state', { cache: 'no-store' })
+        const data = await res.json()
+        const rules = data.preferences?.blocked_companies
+        if (!res.ok || !Array.isArray(rules) || !rules.every(rule => typeof rule === 'string')) {
+          throw new Error(data.error || '读取屏蔽名单失败，请重试。')
+        }
+        return rules
+      }
+      const current = await readRules()
+      setBlockedCompanies(current)
+      const existing = current.find(rule => rule.trim() && company.toLowerCase().includes(rule.trim().toLowerCase()))
+      if (existing) {
+        setSelectedIds([])
+        setPage(0)
+        refreshJobs()
+        setNotice(`“${company}”已被“${existing}”屏蔽。可在配置 → 个人信息 → 屏蔽公司中解除。`)
+        return
+      }
+      const preferences = { blocked_companies: [...current, company] }
+      await postJobAction('/api/agent/config/preview', { preferences })
+      if (!window.confirm(`配置预览\n新增屏蔽公司：${company}\n已有屏蔽规则：${current.join('、') || '无'}\n\n保存后，公司名包含“${company}”的岗位将从列表隐藏，并跳过后续采集和评分。岗位记录和投递状态保留。\n可在“配置 → 个人信息 → 屏蔽公司”中解除，解除后恢复显示。\n\n确认保存？`)) {
+        setNotice('已取消屏蔽，配置未修改。')
+        return
+      }
+      // 确认期间可能在其他页面修改了名单，避免用旧预览覆盖新规则。
+      const latest = await readRules()
+      if (JSON.stringify(latest) !== JSON.stringify(current)) {
+        setBlockedCompanies(latest)
+        throw new Error('屏蔽名单已变化，请重新点击“屏蔽公司”查看最新预览。')
+      }
+      const result = await postJobAction('/api/agent/config/apply', { preferences, confirm: true })
+      setBlockedCompanies(result.preferences.blocked_companies)
+      window.dispatchEvent(new Event('bosshunter-config-saved'))
+      setNotice(`已屏蔽“${company}”，匹配岗位已从列表隐藏，记录保留；解除屏蔽后恢复显示。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '屏蔽公司失败，请重试。')
+    } finally {
+      blockingCompanyRef.current = false
+      setBlockingJobId(null)
+    }
+  }
+
+  const markManuallySent = async (job: Job) => {
+    if (job.source_platform !== 'zhilian' && job.source_platform !== '51job' && job.source_platform !== 'liepin') return
+    const platformLabel = PLATFORM_LABELS[job.source_platform]
+    if (!window.confirm(`请确认：你已经在${platformLabel}完成了这个岗位的投递。此操作只更新 JobPilot 本地记录，不会向平台发送任何内容。`)) return
+    try {
+      const result = await postJobAction('/api/jobs/manual-sent', {
+        job_ids: [job.id],
+        confirmed: true,
+      })
+      refreshJobs()
+      setNotice(
+        result.affected_count
+          ? `已将 ${platformLabel} 岗位标记为“已发送”。`
+          : `该岗位此前已经标记为“已发送”。`
+      )
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '标记已发送失败')
+    }
+  }
+
+  const changeJobStatus = async (job: Job, status: string) => {
+    let message = status === 'sent'
+      ? `确认你已手动完成“${job.company} ${job.title}”的投递？标记后将收录到已投递库，自动投递会跳过此岗位。此操作只更新本地记录，不会发送消息。`
+      : `确认将“${job.company} ${job.title}”状态改为“${getStatusLabel(status)}”吗？`
+    if (status === 'ready' && SENT_LIBRARY_STATUSES.includes(job.status)) {
+      message += '\n改回待确认后，该岗位可能重新进入投递队列。'
+    }
+    if (!window.confirm(message)) return
+    try {
+      await updateJobStatus(job.id, status)
+      refreshJobs()
+      setSelectedIds(previous => previous.filter(id => id !== job.id))
+      setNotice(status === 'sent' ? '已标记为已投递，可在“已投递库”查看；自动投递会跳过此岗位。' : '岗位状态已更新。')
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '修改岗位状态失败')
+    }
+  }
+
+  const changeRecruitmentType = async (job: Job, recruitmentType: string) => {
+    const label = recruitmentType === 'campus' ? '校招' : '社招'
+    if (!window.confirm(`确认将“${job.company} ${job.title}”标记为${label}？所有岗位库将同步显示该标签，投递状态保持不变。`)) return
+    try {
+      await postJobAction('/api/jobs/recruitment-type', { job_ids: [job.id], recruitment_type: recruitmentType })
+      setSelectedIds(previous => previous.filter(id => id !== job.id))
+      refreshJobs()
+      setNotice(`招聘类型已修改为${label}，各岗位库已同步。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '修改招聘类型失败')
+    }
+  }
+
+  const deliverSelectedJobs = async (content: CustomDelivery) => {
+    if (!deliverySelection.length) return
+    const count = deliverySelection.length
+    try {
+      const result = await postJobAction('/api/workbench/deliver', { job_ids: deliverySelection, ...content })
+      setSelectedIds(previous => previous.filter(id => !deliverySelection.includes(id)))
+      setShowDeliveryDialog(false)
+      refreshJobs()
+      setNotice(
+        result.already_queued_count === count
+          ? `所选 ${count} 个岗位已在当前发送队列中。`
+          : result.queued_count
+            ? `已将 ${result.queued_count} 个岗位追加到当前发送队列。`
+            : `已提交 ${count} 个岗位，是否送达请查看投递队列。`
+      )
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '一键投递失败')
+      throw cause
+    }
+  }
+
+  const restoreJobs = async (jobIds: string[]) => {
+    if (!jobIds.length || !window.confirm(`确认恢复 ${jobIds.length} 个岗位吗？恢复后不会自动评分或投递。`)) return
+    try {
+      const result = await postJobAction('/api/jobs/restore', { job_ids: jobIds, confirmed: true })
+      setRecycleSelectedIds(previous => previous.filter(id => !jobIds.includes(id)))
+      refreshJobs()
+      await loadRecycleBin()
+      setNotice(`已恢复 ${result.affected_count || 0} 条岗位。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '恢复失败')
+    }
+  }
+
+  const requestPermanentDelete = (jobIds: string[]) => {
+    if (!jobIds.length) return
+    setPermanentDeleteIds(jobIds)
+    setPermanentDeleteAcknowledged(false)
+  }
+
+  const confirmPermanentDelete = async () => {
+    if (!permanentDeleteIds.length || !permanentDeleteAcknowledged) return
+    try {
+      const result = await postJobAction('/api/jobs/permanent-delete', {
+        job_ids: permanentDeleteIds,
+        confirmed: true,
+        confirmation: 'PERMANENT_DELETE',
+      })
+      setRecycleSelectedIds(previous => previous.filter(id => !permanentDeleteIds.includes(id)))
+      setPermanentDeleteIds([])
+      setPermanentDeleteAcknowledged(false)
+      await loadRecycleBin()
+      setNotice(`已永久删除 ${result.affected_count || 0} 条岗位。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '永久删除失败')
+    }
+  }
+
+  const exportJobs = async (format: 'xlsx' | 'csv', scope: 'all' | 'filtered' | 'selected') => {
+    try {
+      const res = await fetch('/api/jobs/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          format,
+          scope,
+          job_ids: scope === 'selected' ? selectedIds : [],
+          filters: scope === 'filtered' ? {
+            q: filters.query.trim(),
+            company: filters.company.trim(),
+            titles: filters.titles,
+            hr_active: filters.hrActive.trim(),
+            min_score: filters.minScore,
+            max_score: filters.maxScore,
+            salary_min: filters.salaryMin,
+            salary_max: filters.salaryMax,
+            status: filters.status,
+            created_within: filters.createdWithin,
+            source_platform: filters.sourcePlatform,
+            city: filters.city,
+            education: filters.education,
+            recruitment_type: filters.recruitmentType,
+            library,
+          } : {},
+        }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '导出失败')
+      }
+      const blob = await res.blob()
+      const disposition = res.headers.get('Content-Disposition') || ''
+      const filename = disposition.match(/filename="?([^";]+)"?/i)?.[1] || `jobpilot-jobs.${format}`
+      const url = window.URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      anchor.click()
+      window.URL.revokeObjectURL(url)
+      const exportedCount = Number(res.headers.get('X-Exported-Count'))
+      setNotice(`已导出 ${Number.isFinite(exportedCount) ? exportedCount : 0} 条岗位。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '导出失败')
+    }
+  }
+
+  const startScoring = async (options: {
+    scope: 'pending' | 'failed' | 'selected' | 'all_scored'
+    limit: number | null
+    job_ids: string[]
+    force_rescore: boolean
+    force?: boolean
+  }): Promise<{ ok: boolean; error?: string }> => {
+    const res = await fetch('/api/scoring/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ options, force: options.force ?? false }),
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      if (res.status === 409 && data.code === 'scoring_run_paused' && !options.force) {
+        const confirmed = window.confirm(
+          `已有等待恢复的评分任务：${data.error || ''}\n是否结束该任务并强制开始新评分任务？（已完成的评分结果会保留）`,
+        )
+        if (confirmed) {
+          return await startScoring({ ...options, force: true })
+        }
+      }
+      const checks = Array.isArray(data.messages) ? data.messages.join('；') : ''
+      return { ok: false, error: [data.error || '启动评分失败', checks].filter(Boolean).join('：') }
+    }
+    setNotice(`独立评分已启动，共 ${data.run?.remaining_job_ids?.length || 0} 个岗位。`)
+    await refreshWorkbench()
+    return { ok: true }
+  }
+
+  const startQuickScoring = async () => {
+    if (!window.confirm('将对岗位池中所有未评分或评分失败的岗位启动 AI 评分，可能产生模型费用，是否继续？')) return
+    setQuickScoring(true)
+    try {
+      const result = await startScoring({ scope: 'pending', limit: null, job_ids: [], force_rescore: false })
+      if (!result.ok) setNotice(result.error || '启动 AI 评分失败')
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '启动 AI 评分失败')
+    } finally {
+      setQuickScoring(false)
+    }
+  }
+
+  if (showRecycleBin) {
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <Button variant="ghost" size="sm" onClick={() => setShowRecycleBin(false)}>返回岗位池</Button>
+          <Button variant="secondary" size="sm" onClick={() => void loadRecycleBin()} disabled={recycleLoading}>刷新回收站</Button>
+        </div>
+        {notice && <div className="rounded-xl bg-secondary px-4 py-3 text-sm text-primary">{notice}</div>}
+        <RecycleBinPanel
+          jobs={recycleJobs}
+          selectedIds={recycleSelectedIds}
+          loading={recycleLoading}
+          onToggleSelected={id => setRecycleSelectedIds(previous => previous.includes(id) ? previous.filter(item => item !== id) : [...previous, id])}
+          onSelectAll={setRecycleSelectedIds}
+          onRestore={ids => void restoreJobs(ids)}
+          onPermanentDelete={requestPermanentDelete}
+        />
+        {permanentDeleteIds.length > 0 && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4" role="dialog" aria-modal="true">
+            <div className="w-full max-w-lg rounded-3xl border border-danger-border bg-card p-6 shadow-2xl">
+              <div className="flex items-start gap-3"><AlertTriangle className="mt-0.5 h-6 w-6 shrink-0 text-danger" /><div><h3 className="text-xl font-black">确认永久删除</h3><p className="mt-2 text-sm leading-6 text-muted">将永久删除 {permanentDeleteIds.length} 条岗位及其历史，无法恢复。存在发送或回复证据的岗位会被后端拒绝删除。</p></div></div>
+              <label className="mt-5 flex cursor-pointer items-start gap-3 rounded-2xl border border-danger-border bg-danger-soft p-3 text-sm font-bold"><input type="checkbox" checked={permanentDeleteAcknowledged} onChange={event => setPermanentDeleteAcknowledged(event.target.checked)} className="mt-0.5 h-4 w-4 accent-danger" /><span>我确认永久删除，并了解此操作无法撤销。</span></label>
+              <div className="mt-6 flex justify-end gap-3"><Button variant="secondary" size="sm" onClick={() => setPermanentDeleteIds([])}>取消</Button><Button variant="destructive" size="sm" disabled={!permanentDeleteAcknowledged} onClick={() => void confirmPermanentDelete()}>永久删除</Button></div>
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-3xl border border-border/80 bg-card p-5 shadow-xs transition-colors">
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight text-foreground">岗位池</h2>
+          <p className="mt-1 text-sm text-muted">集中查看已采集岗位、AI 分数、状态和详情入口。</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button variant="secondary" size="sm" onClick={() => { setShowRecycleBin(true); void loadRecycleBin() }}><Trash2 className="mr-1 h-4 w-4" />回收站 ({recycleJobs.length})</Button>
+          <BriefcaseBusiness className="h-6 w-6 text-primary" />
+        </div>
+      </div>
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-1 rounded-2xl border border-border/70 bg-secondary/50 p-1 text-xs" role="group" aria-label="岗位库">
+          <button
+            type="button"
+            aria-pressed={!companyLibrary && !inSentLibrary && !inFilteredLibrary && !inCampusLibrary && !inSocialLibrary}
+            onClick={() => {
+              setCompanyLibrary(false)
+              setLibrary('all')
+              setFilters({ ...EMPTY_JOB_FILTERS })
+              setSelectedIds([])
+              setPage(0)
+            }}
+            className={`rounded-xl px-3 py-1.5 font-semibold transition-all ${
+              !companyLibrary && !inSentLibrary && !inFilteredLibrary && !inCampusLibrary && !inSocialLibrary
+                ? 'bg-card text-foreground font-bold shadow-xs border border-border/60'
+                : 'text-muted hover:text-foreground'
+            }`}
+          >全部岗位</button>
+          <button
+            type="button"
+            aria-pressed={!companyLibrary && inSentLibrary}
+            onClick={() => {
+              setCompanyLibrary(false)
+              setLibrary('sent')
+              setFilters({ ...EMPTY_JOB_FILTERS, status: SENT_LIBRARY_STATUSES })
+              setSelectedIds([])
+              setPage(0)
+            }}
+            className={`rounded-xl px-3 py-1.5 font-semibold transition-all ${
+              !companyLibrary && inSentLibrary
+                ? 'bg-card text-foreground font-bold shadow-xs border border-border/60'
+                : 'text-muted hover:text-foreground'
+            }`}
+          >已投递库</button>
+          <button
+            type="button"
+            aria-pressed={!companyLibrary && inFilteredLibrary}
+            onClick={() => {
+              setCompanyLibrary(false)
+              setLibrary('filtered')
+              setFilters({ ...EMPTY_JOB_FILTERS })
+              setSelectedIds([])
+              setPage(0)
+            }}
+            className={`rounded-xl px-3 py-1.5 font-semibold transition-all ${
+              !companyLibrary && inFilteredLibrary
+                ? 'bg-card text-foreground font-bold shadow-xs border border-border/60'
+                : 'text-muted hover:text-foreground'
+            }`}
+          >过滤库</button>
+          <button
+            type="button"
+            aria-pressed={!companyLibrary && inCampusLibrary}
+            onClick={() => {
+              setCompanyLibrary(false)
+              setLibrary('all')
+              setFilters({ ...EMPTY_JOB_FILTERS, recruitmentType: ['campus'] })
+              setSelectedIds([])
+              setPage(0)
+            }}
+            className={`rounded-xl px-3 py-1.5 font-semibold transition-all ${
+              !companyLibrary && inCampusLibrary
+                ? 'bg-card text-foreground font-bold shadow-xs border border-border/60'
+                : 'text-muted hover:text-foreground'
+            }`}
+          >校招</button>
+          <button
+            type="button"
+            aria-pressed={!companyLibrary && inSocialLibrary}
+            onClick={() => {
+              setCompanyLibrary(false)
+              setLibrary('all')
+              setFilters({ ...EMPTY_JOB_FILTERS, recruitmentType: ['experienced'] })
+              setSelectedIds([])
+              setPage(0)
+            }}
+            className={`rounded-xl px-3 py-1.5 font-semibold transition-all ${
+              !companyLibrary && inSocialLibrary
+                ? 'bg-card text-foreground font-bold shadow-xs border border-border/60'
+                : 'text-muted hover:text-foreground'
+            }`}
+          >社招</button>
+          <button
+            type="button"
+            aria-pressed={companyLibrary}
+            onClick={() => { setCompanyLibrary(true); setNotice('') }}
+            className={`rounded-xl px-3 py-1.5 font-semibold transition-all ${
+              companyLibrary
+                ? 'bg-card text-foreground font-bold shadow-xs border border-border/60'
+                : 'text-muted hover:text-foreground'
+            }`}
+          >检索库</button>
+        </div>
+
+        {!companyLibrary && (
+          <div className="flex items-center rounded-2xl border border-card-border bg-secondary/50 p-1 text-xs">
+            <button
+              type="button"
+              onClick={() => setPoolMode('table')}
+              className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 font-bold transition-all ${
+                poolMode === 'table' ? 'bg-card text-primary shadow-sm' : 'text-muted hover:text-foreground'
+              }`}
+            >
+              <TableIcon className="h-3.5 w-3.5" /> 列表表格
+            </button>
+            <button
+              type="button"
+              onClick={() => setPoolMode('swipe')}
+              className={`flex items-center gap-1.5 rounded-xl px-3 py-1.5 font-bold transition-all ${
+                poolMode === 'swipe' ? 'bg-card text-primary shadow-sm' : 'text-muted hover:text-foreground'
+              }`}
+            >
+              <Sparkles className="h-3.5 w-3.5" /> 灵动挑岗
+            </button>
+          </div>
+        )}
+      </div>
+      {companyLibrary ? <>
+        {notice && <p role="status" className="mb-3 text-sm">{notice}</p>}
+        <CompanySearchLibrary />
+      </> : poolMode === 'swipe' ? <>
+        {inFilteredLibrary && <p className="mb-3 text-xs text-muted">过滤岗位单独保留，不计入全部岗位；手动标记或投递成功后也可在已投递库查看。</p>}
+        {notice && <div className="mb-4 rounded-xl bg-secondary px-4 py-3 text-sm text-primary">{notice}</div>}
+        <JobFilterBar
+          filters={filters}
+          onChange={setFilters}
+          onReset={() => setFilters({ ...EMPTY_JOB_FILTERS })}
+          resultCount={total}
+          totalCount={allTotal}
+          invalidSalary={hasInvalidSalaryRange(filters)}
+          showStatus
+          showSource
+          cityOptions={cityOptions}
+        />
+        <JobSwipeView
+          filters={filters}
+          library={library}
+          swipeContext={swipeContext}
+          onStatusChange={async (job, status) => {
+            await updateJobStatus(job.id, status)
+            refreshJobs()
+          }}
+          onNotice={setNotice}
+          onSwitchToTable={() => setPoolMode('table')}
+        />
+      </> : <>
+      {inFilteredLibrary && <p className="mb-3 text-xs text-muted">过滤岗位单独保留，不计入全部岗位；手动标记或投递成功后也可在已投递库查看。</p>}
+      <JobFilterBar
+        filters={filters}
+        onChange={setFilters}
+        onReset={() => setFilters({ ...EMPTY_JOB_FILTERS })}
+        resultCount={total}
+        totalCount={allTotal}
+        invalidSalary={hasInvalidSalaryRange(filters)}
+        showStatus
+        showSource
+        cityOptions={cityOptions}
+      />
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs">
+        <Button variant="secondary" size="sm" disabled={!items.length} onClick={toggleCurrentPage}>
+          {allPageSelected ? '取消选择本页' : '选择本页'}
+        </Button>
+        <span className="rounded-full bg-secondary px-3 py-2 font-bold text-primary">已选择 {selectedIds.length} 条</span>
+        {selectedIds.length > 0 && <Button variant="ghost" size="sm" onClick={() => setSelectedIds([])}>清空选择</Button>}
+        <Button variant="destructive" size="sm" disabled={!selectedIds.length} onClick={() => void softDelete(selectedIds)}>移入回收站</Button>
+        <Button size="sm" disabled={!selectedIds.length} onClick={() => { setDeliverySelection([...selectedIds]); setShowDeliveryDialog(true) }}>
+          <Send className="mr-1 h-4 w-4" />BOSS 一键投递已选
+        </Button>
+        <Button variant="secondary" size="sm" onClick={() => { setDeliverySelection([]); setShowDeliveryDialog(true) }}>管理招呼搭配</Button>
+        <span className="text-muted">无需先评分，投递成功后自动标记已投递</span>
+        <Button size="sm" onClick={() => void startQuickScoring()} disabled={quickScoring || !total}>
+          {quickScoring ? '启动评分中…' : '一键 AI 评分'}
+        </Button>
+        <Button variant="secondary" size="sm" onClick={() => setShowScoreDialog(true)}>评分选项</Button>
+        <ExportMenu onExport={exportJobs} hasSelection={selectedIds.length > 0} hasFiltered={total > 0} />
+      </div>
+      {notice && <div className="mb-4 rounded-xl bg-secondary px-4 py-3 text-sm text-primary">{notice}</div>}
+      <div className="mb-4">
+        {visibleScoreTasks.map(task => <TaskScoringProgress key={task.id} task={task} />)}
+        <p className="mt-2 text-xs text-muted">
+          岗位与评分进度每 5 秒自动刷新；每完成一个岗位后更新评分计数。
+          {jobsRefreshedAt && ` 岗位更新于 ${jobsRefreshedAt.toLocaleTimeString('zh-CN', { hour12: false })}`}
+        </p>
+        {progressError && <p role="alert" className="mt-2 text-xs text-danger">{progressError}</p>}
+      </div>
+      {deliveryTask && (
+        <div className="mb-4 rounded-2xl border border-card-border bg-surface p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-sm font-black">投递队列</div>
+              <p className="mt-1 text-xs text-muted">只展示已人工确认的 BOSS 发送任务；智联和 51job 不会进入此队列。</p>
+            </div>
+            <span className="rounded-full bg-secondary px-3 py-1 text-xs font-black text-primary">
+              {deliveryTask.status === 'running' ? '处理中'
+                : deliveryTask.status === 'completed'
+                  ? Number(deliveryTask.metrics?.send_deferred || 0) > 0
+                    ? Number(deliveryTask.metrics?.send_success || 0) > 0 ? '部分未发送' : '未发送'
+                    : Number(deliveryTask.metrics?.send_failed || 0) > 0 ? '存在发送失败' : '已结束'
+                  : deliveryTask.status === 'failed' ? '失败' : deliveryTask.status}
+            </span>
+          </div>
+          <div className="mt-3 rounded-xl border border-card-border bg-card px-3 py-2 text-sm">
+            <p className="mb-2 font-bold">本次文字已送达 {Number(deliveryTask.metrics?.send_success || 0)} · 已沟通跳过 {Number(deliveryTask.metrics?.send_existing_contact || 0)} · 发送失败 {Number(deliveryTask.metrics?.send_failed || 0)} · 未发送 {Number(deliveryTask.metrics?.send_deferred || 0)}</p>
+            {deliveryTask.stop_reason && <p role="status" className="mb-2 text-warning">{taskStopReasonLabel(deliveryTask.stop_reason)}</p>}
+            <div className="font-bold">{deliveryTask.logs?.[deliveryTask.logs.length - 1] || '队列已创建，等待执行'}</div>
+            <div className="mt-1 text-xs text-muted">任务 ID：{deliveryTask.id}</div>
+          </div>
+        </div>
+      )}
+      {error && <div className="mb-4 rounded-xl border border-danger-border bg-danger-soft px-4 py-3 text-sm text-danger">{error}</div>}
+      <JobsTable
+        jobs={items}
+        page={page}
+        pageSize={pageSize}
+        total={total}
+        onPageChange={setPage}
+        selectedIds={selectedIds}
+        onToggleSelected={toggleSelected}
+        onSoftDelete={job => void softDelete([job.id])}
+        onMarkManuallySent={job => void markManuallySent(job)}
+        onStatusChange={changeJobStatus}
+        onRecruitmentTypeChange={changeRecruitmentType}
+        onBlockCompany={job => void blockCompany(job)}
+        onStartSwipeAtJob={(job, index, currentJobs, currentPage) => {
+          setSwipeContext({
+            initialJobId: job.id,
+            initialJobs: currentJobs,
+            initialIndex: index,
+            initialPage: currentPage,
+          })
+          setPoolMode('swipe')
+        }}
+        blockedCompanies={blockedCompanies}
+        blockingJobId={blockingJobId}
+        loading={loading}
+        sortBy={sortBy}
+        sortOrder={sortOrder}
+        onSortChange={changeSort}
+        filters={filters}
+        onFiltersChange={setFilters}
+        cityOptions={cityOptions}
+        titleOptions={titleOptions}
+      />
+      <ScoreJobsDialog
+        open={showScoreDialog}
+        selectedJobIds={selectedIds}
+        onClose={() => setShowScoreDialog(false)}
+        onStart={startScoring}
+      />
+      <DeliveryDialog open={showDeliveryDialog} count={deliverySelection.length} jobIds={deliverySelection} onClose={() => setShowDeliveryDialog(false)} onConfirm={deliverSelectedJobs} />
+      </>}
+    </div>
+  )
+}
+
+function ExportMenu({
+  onExport,
+  hasSelection,
+  hasFiltered,
+}: {
+  onExport: (format: 'xlsx' | 'csv', scope: 'all' | 'filtered' | 'selected') => void
+  hasSelection: boolean
+  hasFiltered: boolean
+}) {
+  const [format, setFormat] = useState<'xlsx' | 'csv'>('xlsx')
+  return (
+    <div className="ml-auto flex flex-wrap items-center gap-2">
+      <select
+        value={format}
+        onChange={event => setFormat(event.target.value as 'xlsx' | 'csv')}
+        className="rounded-xl border border-card-border bg-card px-2 py-2 text-xs outline-none focus:border-primary"
+      >
+        <option value="xlsx">XLSX</option>
+        <option value="csv">CSV</option>
+      </select>
+      <Button variant="secondary" size="sm" disabled={!hasFiltered} onClick={() => onExport(format, 'filtered')}>导出筛选结果</Button>
+      <Button variant="secondary" size="sm" disabled={!hasSelection} onClick={() => onExport(format, 'selected')}>导出所选岗位</Button>
+      <Button variant="secondary" size="sm" onClick={() => onExport(format, 'all')}>导出全部岗位</Button>
+    </div>
+  )
+}
+
+type MonitorFilter = 'pending' | 'resume' | 'follow_up' | 'replied'
+const REPLY_RESOLUTION_ACTIONS = ['reply_dismissed', 'replied', 'auto_replied']
+const DETECTION_RESOLUTION_ACTIONS = [
+  ...REPLY_RESOLUTION_ACTIONS,
+  'reply_pending',
+  'needs_resume',
+  'resume_failed',
+  'resume_sent',
+  'rejected',
+]
+
+function uniqueLatestByJob(items: HistoryItem[]) {
+  const seen = new Set<string>()
+  return items.filter(item => {
+    const key = item.job_id || `${item.company}-${item.title}-${item.action}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function sameHistoryJob(left: HistoryItem, right: HistoryItem) {
+  if (left.job_id && right.job_id) return left.job_id === right.job_id
+  return left.company === right.company && left.title === right.title
+}
+
+function isReplyPendingResolved(item: HistoryItem, history: HistoryItem[]) {
+  return history.some(candidate =>
+    candidate.id !== item.id
+    && sameHistoryJob(item, candidate)
+    && REPLY_RESOLUTION_ACTIONS.includes(candidate.action)
+    && candidate.created_at >= item.created_at
+  )
+}
+
+function isResumeFailureResolved(item: HistoryItem, history: HistoryItem[]) {
+  return Boolean(item.resolved || item.resume_path) || history.some(candidate =>
+    candidate.id > item.id
+    && sameHistoryJob(item, candidate)
+    && (candidate.action === 'needs_resume' || candidate.action === 'resume_sent' || candidate.action === 'resume_failed_dismissed')
+  )
+}
+
+function isDetectedReplyResolved(item: HistoryItem, history: HistoryItem[]) {
+  return history.some(candidate =>
+    candidate.id > item.id
+    && sameHistoryJob(item, candidate)
+    && DETECTION_RESOLUTION_ACTIONS.includes(candidate.action)
+  )
+}
+
+function isResumeRequestResolved(item: HistoryItem, history: HistoryItem[]) {
+  return history.some(candidate =>
+    candidate.id > item.id
+    && sameHistoryJob(item, candidate)
+    && candidate.action === 'resume_sent'
+  )
+}
+
+function isOutboundReplyRecord(item: HistoryItem) {
+  if (item.action === 'resume_sent') return true
+  if (item.action === 'auto_replied') return true
+  return item.action === 'replied' && parseHistoryDetail(item).schema.startsWith('replied.')
+}
+
+type MonitorConversationMessage = {
+  sender: 'hr' | 'ai'
+  text: string
+}
+
+function monitorConversationMessages(item: HistoryItem, history: HistoryItem[]): MonitorConversationMessage[] {
+  const parsed = parseHistoryDetail(item)
+  const pendingItem = parsed.pendingHistoryId
+    ? history.find(candidate => candidate.id === parsed.pendingHistoryId)
+    : undefined
+  const pendingParsed = pendingItem ? parseHistoryDetail(pendingItem) : null
+  const resumeRequestItem = item.action === 'resume_sent'
+    ? history
+      .filter(candidate =>
+        candidate.id < item.id
+        && candidate.action === 'needs_resume'
+        && sameHistoryJob(item, candidate)
+      )
+      .sort((left, right) => right.id - left.id)[0]
+    : undefined
+  const resumeRequestParsed = resumeRequestItem ? parseHistoryDetail(resumeRequestItem) : null
+  const source = parsed.conversationTail.length
+    ? parsed
+    : (pendingParsed || resumeRequestParsed || parsed)
+  const messages: MonitorConversationMessage[] = []
+
+  const append = (sender: 'hr' | 'ai', text: string) => {
+    const normalizedText = text.trim()
+    if (!normalizedText) return
+    const previous = messages[messages.length - 1]
+    if (previous?.sender === sender && previous.text === normalizedText) return
+    messages.push({ sender, text: normalizedText })
+  }
+
+  source.conversationTail.forEach(message => {
+    if (message.sender === 'hr') append('hr', message.text)
+    if (message.sender === 'me') append('ai', message.text)
+  })
+
+  const hrQuestion = parsed.hrQuestion || source.hrQuestion
+  if (!messages.some(message => message.sender === 'hr')) append('hr', hrQuestion)
+  if (item.action !== 'resume_sent' && isOutboundReplyRecord(item) && !parsed.schema.startsWith('replied.external.')) {
+    append('ai', parsed.aiReply)
+  }
+
+  return messages
+}
+
+function MonitorExecutionView({
+  history,
+  refresh,
+  refreshing,
+  lastRefreshedAt,
+}: {
+  history: HistoryItem[]
+  refresh: () => Promise<void>
+  refreshing: boolean
+  lastRefreshedAt: Date | null
+}) {
+  const pendingReplies = uniqueLatestByJob(history.filter(item =>
+    item.action === 'reply_pending' && !isReplyPendingResolved(item, history)
+  ))
+  const detectedReplies = uniqueLatestByJob(history.filter(item =>
+    item.action === 'hr_reply_detected' && !isDetectedReplyResolved(item, history)
+  ))
+  const resumeFailures = uniqueLatestByJob(history.filter(item =>
+    item.action === 'resume_failed' && !isResumeFailureResolved(item, history)
+  ))
+  const pendingItems = uniqueLatestByJob(
+    [...detectedReplies, ...pendingReplies, ...resumeFailures].sort((left, right) => right.id - left.id)
+  )
+  const pendingResumeRequests = history.filter(item =>
+    item.action === 'needs_resume' && !isResumeRequestResolved(item, history)
+  )
+  const resumeRequests = uniqueLatestByJob(
+    [...pendingResumeRequests, ...resumeFailures].sort((left, right) => right.id - left.id)
+  )
+  const followUpRecords = uniqueLatestByJob(history.filter(item => item.action === 'follow_up_sent'))
+  const repliedRecords = history.filter(isOutboundReplyRecord)
+  const [activeMonitorFilter, setActiveMonitorFilter] = useState<MonitorFilter>('pending')
+  const visibleHistory = activeMonitorFilter === 'resume'
+    ? resumeRequests
+    : activeMonitorFilter === 'follow_up'
+      ? followUpRecords
+      : activeMonitorFilter === 'replied'
+        ? repliedRecords
+        : pendingItems
+  const displayedHistory = activeMonitorFilter === 'pending' || activeMonitorFilter === 'resume'
+    ? visibleHistory
+    : visibleHistory.slice(0, 8)
+  const [replyDrafts, setReplyDrafts] = useState<Record<number, string>>({})
+  const [notice, setNotice] = useState('')
+  const [openingChatId, setOpeningChatId] = useState<number | null>(null)
+  const [preparingReplyId, setPreparingReplyId] = useState<number | null>(null)
+
+  const draftFor = (item: HistoryItem) => {
+    const parsed = parseHistoryDetail(item)
+    return replyDrafts[item.id] ?? parsed.aiReply ?? item.detail ?? ''
+  }
+
+  const sendManualReply = async (item: HistoryItem) => {
+    try {
+      const res = await fetch(`/api/history/${item.id}/reply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: draftFor(item) }),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '回复失败')
+      }
+      await refresh()
+      setNotice('回复已记录，请在招聘平台手动发送。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '回复失败')
+    }
+  }
+
+  const dismissPendingReply = async (item: HistoryItem) => {
+    if (!window.confirm('确定放弃这条待回复建议吗？放弃后不会发送消息，也不会把岗位标记为拒绝。')) return
+    try {
+      const res = await fetch(`/api/history/${item.id}/dismiss`, { method: 'POST' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '放弃失败')
+      }
+      await refresh()
+      setNotice('已放弃这条待回复建议。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '放弃失败')
+    }
+  }
+
+  const openMonitorConversation = async (item: HistoryItem) => {
+    const platform = item.source_platform || 'boss'
+    if (platform !== 'boss') {
+      const targetUrl = monitorChatUrl(item)
+      if (targetUrl) window.open(targetUrl, '_blank', 'noopener,noreferrer')
+      return
+    }
+    setOpeningChatId(item.id)
+    try {
+      const res = await fetch(`/api/history/${item.id}/open-chat`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || '聊天定位失败')
+      setNotice('已在 BOSS 中定位到对应聊天对话。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '聊天定位失败')
+    } finally {
+      setOpeningChatId(null)
+    }
+  }
+
+  const prepareDetectedReply = async (item: HistoryItem) => {
+    setPreparingReplyId(item.id)
+    try {
+      const res = await fetch(`/api/history/${item.id}/prepare-reply`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || '对话读取失败')
+      await refresh()
+      setNotice(data.already_processed ? '这条消息已经处理。' : '完整对话已读取，请检查生成的处理结果。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '对话读取失败')
+    } finally {
+      setPreparingReplyId(null)
+    }
+  }
+
+  const retryResumeGeneration = async (item: HistoryItem) => {
+    if (!window.confirm('确定重新生成这份定制简历吗？需要 AI 接口和 Chrome 环境正常。')) return
+    try {
+      const res = await fetch(`/api/history/${item.id}/resume-retry`, { method: 'POST' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '重试生成失败')
+      }
+      await refresh()
+      setNotice('定制简历已重新生成，请到工作台HR 要简历区域下载发送。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '重试生成失败')
+    }
+  }
+
+  const dismissResumeFailure = async (item: HistoryItem) => {
+    if (!window.confirm('确定放弃这条简历生成失败记录吗？放弃后将不再出现在待处理中。')) return
+    try {
+      const res = await fetch(`/api/history/${item.id}/resume-dismiss`, { method: 'POST' })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || '忽略失败')
+      }
+      await refresh()
+      setNotice('已放弃这条简历生成失败记录。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '忽略失败')
+    }
+  }
+
+  return (
+    <div className="rounded-3xl border border-card-border bg-card p-5">
+      <div className="mb-4 flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight text-foreground">监测执行</h2>
+          <p className="mt-1 text-sm text-muted">这里不启动监测，只处理监测发现的 HR 问题、回复建议和结果。</p>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <span className="text-xs text-muted">
+            {lastRefreshedAt ? `更新于 ${lastRefreshedAt.toLocaleTimeString('zh-CN', { hour12: false })}` : '正在读取'} · 每 2 秒刷新
+          </span>
+          <Button variant="secondary" size="sm" onClick={refresh} disabled={refreshing}>
+            <RefreshCw className={`mr-2 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+            {refreshing ? '刷新中' : '立即刷新'}
+          </Button>
+          <span className="rounded-full bg-secondary px-3 py-2 text-xs font-black text-primary">待处理 {pendingItems.length}</span>
+        </div>
+      </div>
+      <div className="mb-4 flex flex-wrap gap-2">
+        {[
+          { key: 'pending' as const, label: '待处理', count: pendingItems.length },
+          { key: 'resume' as const, label: '简历请求', count: resumeRequests.length },
+          { key: 'follow_up' as const, label: '自动跟进', count: followUpRecords.length },
+          { key: 'replied' as const, label: '已回复', count: repliedRecords.length },
+        ].map(item => {
+          const active = activeMonitorFilter === item.key
+          return (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setActiveMonitorFilter(item.key)}
+              className={`rounded-full px-3 py-1 text-xs font-bold transition ${active ? 'bg-primary text-primary-foreground' : 'border border-card-border text-muted hover:border-primary/60 hover:text-primary'}`}
+            >
+              {item.label} {item.count}
+            </button>
+          )
+        })}
+      </div>
+      {notice && <div className="mb-3 rounded-2xl bg-secondary px-4 py-3 text-sm text-primary">{notice}</div>}
+      <div className="space-y-3">
+        {displayedHistory.map((item, index) => {
+          const canReply = item.action === 'reply_pending'
+          const isFollowUp = item.action === 'follow_up_sent'
+          const isDetectedReply = item.action === 'hr_reply_detected'
+          const isResumeFailure = item.action === 'resume_failed'
+          const isResumeRequest = item.action === 'needs_resume' || isResumeFailure
+          const isReplied = isOutboundReplyRecord(item)
+          const parsed = parseHistoryDetail(item)
+          const hasGeneratedReply = !isDetectedReply && Boolean(parsed.aiReply)
+          const detectedReplyPreview = isDetectedReply ? item.detail.replace(/^HR回复:\s*/, '') : ''
+          const conversationMessages = monitorConversationMessages(item, history)
+          const showReplyContent = canReply || Boolean(parsed.hrQuestion) || hasGeneratedReply || isResumeRequest || isReplied || conversationMessages.length > 0
+          const systemFailureReason = parsed.systemReason || (isResumeFailure ? '未获得更具体的错误信息，请查看运行日志。' : '')
+          const targetUrl = monitorChatUrl(item)
+          const openingChat = openingChatId === item.id
+          const preparingReply = preparingReplyId === item.id
+          const canOpenChat = (item.source_platform || 'boss') === 'boss' ? Boolean(item.id) : Boolean(targetUrl)
+          return (
+            <div key={item.id || `${item.created_at}-${index}`} className="grid gap-3 rounded-2xl border border-card-border bg-surface p-4 lg:grid-cols-[130px_1fr_160px]">
+              <div className="text-xs text-muted">
+                <div>{item.created_at}</div>
+                <div className="mt-2 rounded-full bg-card px-2 py-1 text-center font-bold text-primary">{getActionLabel(item.action)}</div>
+              </div>
+              <div>
+                <div className="font-black">{item.company || '岗位'}｜{item.title || '监测记录'}</div>
+                {isDetectedReply ? (
+                  <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-muted">{detectedReplyPreview}</p>
+                ) : showReplyContent ? (
+                  <div className="mt-3 space-y-3">
+                    {isFollowUp && (
+                      <div>
+                        <div className="text-xs font-black text-primary">自动跟进说明</div>
+                        <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-muted">
+                          HR 超过设定时间未回复，系统已自动执行一次跟进。
+                        </p>
+                      </div>
+                    )}
+                    {conversationMessages.length > 0 && (
+                      <div className="overflow-hidden rounded-2xl border border-card-border bg-card">
+                        <div className="flex items-center justify-between border-b border-card-border px-3 py-1.5">
+                          <span className="text-xs font-black text-foreground">聊天记录</span>
+                        </div>
+                        <div className="max-h-[260px] divide-y divide-card-border overflow-y-auto overscroll-contain">
+                          {conversationMessages.map((message, messageIndex) => {
+                            const fromHr = message.sender === 'hr'
+                            return (
+                              <div key={`${item.id}-${messageIndex}-${message.sender}`} className="grid grid-cols-[28px_minmax(0,1fr)] items-start gap-2 px-3 py-1.5">
+                                <div className={`flex h-7 w-7 items-center justify-center rounded-full text-[10px] font-black ${fromHr ? 'bg-secondary text-primary' : 'bg-success-soft text-success'}`}>
+                                  {fromHr ? 'HR' : 'AI'}
+                                </div>
+                                <p className="min-w-0 whitespace-pre-wrap break-words text-[13px] leading-5 text-foreground">{message.text}</p>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {isResumeFailure && (
+                      <div className="rounded-2xl border border-danger/30 bg-danger-soft p-3">
+                        <div className="text-xs font-black text-danger">系统失败原因</div>
+                        <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-danger">{systemFailureReason}</p>
+                      </div>
+                    )}
+                    {canReply ? (
+                      <div>
+                        <div className="mb-1 text-xs font-black text-primary">AI 建议回复（尚未回答）</div>
+                        <textarea
+                          id={`reply-draft-${item.id}`}
+                          value={draftFor(item)}
+                          onChange={event => setReplyDrafts(prev => ({ ...prev, [item.id]: event.target.value }))}
+                          className="min-h-[92px] w-full rounded-2xl border border-card-border bg-card p-3 text-sm leading-6 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20"
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-sm leading-6 text-muted">{item.detail || getActionLabel(item.action)}</p>
+                )}
+                {isDetectedReply ? (
+                  <p className="mt-2 text-xs text-primary">已检测到 HR 新消息，等待继续读取完整对话并生成处理结果。</p>
+                ) : canReply ? (
+                  <p className="mt-2 text-xs text-primary">AI 建议：需要人工确认后再回复。</p>
+                ) : item.action === 'needs_resume' ? (
+                  <p className="mt-2 text-xs text-primary">简历请求：监测发现 HR 要简历，已生成定制简历，等待手动发送。</p>
+                ) : item.action === 'resume_sent' ? (
+                  <p className="mt-2 text-xs text-primary">已回复：定制简历已发送，本轮聊天记录保留在上方。</p>
+                ) : isResumeFailure ? (
+                  <p className="mt-2 text-xs text-danger">待处理：定制简历生成失败，尚无可下载文件，请手动处理或稍后重试生成。</p>
+                ) : isReplied ? (
+                  <p className="mt-2 text-xs text-primary">已回答：本轮 HR 与 AI 回复已保留在上方聊天记录中。</p>
+                ) : null}
+              </div>
+              <div className="grid gap-2">
+                <div className="grid gap-2">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={!canOpenChat || openingChat}
+                    onClick={() => void openMonitorConversation(item)}
+                  >
+                    <ExternalLink className="mr-2 h-4 w-4" />{openingChat ? '定位中' : monitorLinkLabel(item)}
+                  </Button>
+                  {isDetectedReply ? (
+                    <Button size="sm" disabled={preparingReply} onClick={() => void prepareDetectedReply(item)}>
+                      {preparingReply ? '读取中' : '读取并生成建议'}
+                    </Button>
+                  ) : canReply ? (
+                    <>
+                      <Button size="sm" onClick={() => sendManualReply(item)}><MessageCircle className="mr-2 h-4 w-4" />确认回复</Button>
+                      <Button variant="secondary" size="sm" onClick={() => document.getElementById(`reply-draft-${item.id}`)?.focus()}>编辑回复</Button>
+                      <Button variant="secondary" size="sm" onClick={() => dismissPendingReply(item)}>放弃</Button>
+                    </>
+                  ) : isResumeFailure ? (
+                    <>
+                      <Button size="sm" variant="secondary" onClick={() => retryResumeGeneration(item)}><RefreshCw className="mr-2 h-4 w-4" />重试生成</Button>
+                      <Button variant="secondary" size="sm" onClick={() => dismissResumeFailure(item)}><XCircle className="mr-2 h-4 w-4" />放弃</Button>
+                    </>
+                  ) : (
+                    <div className="px-2 py-1 text-center text-xs text-muted">本轮已处理，无需再次确认</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )
+        })}
+        {!visibleHistory.length && (
+          <div className="rounded-2xl border border-dashed border-card-border bg-surface p-5 text-sm text-muted">
+            {activeMonitorFilter === 'replied' ? '暂无近 7 天已回复对话。' : '暂无待处理 HR 问题。'}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
