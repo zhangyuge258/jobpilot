@@ -32,6 +32,7 @@ pdf = [
 ]
 
 [project.scripts]
+jobpilot = "bosshunter.main:cli"
 bosshunter = "bosshunter.main:cli"
 
 [tool.hatch.build.targets.wheel]

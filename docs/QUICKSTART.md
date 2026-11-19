@@ -1,13 +1,13 @@
-# BossHunter 完整上手指南
+# JobPilot 完整上手指南
 
-本指南适合第一次安装和运行 BossHunter。首页只保留最短启动路径，平台登录、浏览器连接和排错细节统一放在这里。
+本指南适合第一次安装和运行 JobPilot。首页只保留最短启动路径，平台登录、浏览器连接和排错细节统一放在这里。
 
 ## 1. 准备环境
 
 | 依赖 | 版本 | 用途 |
 |---|---|---|
 | Python | 3.10+ | 核心运行时 |
-| Node.js | 22+ | 本地 Browser Runtime / CDP 代理 |
+| Node.js | 18+ (推荐 20+) | 本地 Browser Runtime / CDP 代理 |
 | Google Chrome | 最新稳定版 | 连接已登录的招聘平台 |
 | Git | — | 下载和更新源码（源码安装时需要） |
 | AI API Key | — | Anthropic 或 OpenAI 兼容接口 |
@@ -21,8 +21,8 @@ Windows 用户请直接按下面的「Windows 首次安装与桌面快捷方式�
 首次使用请先在 frontend 目录构建前端产物（`dist` 不随 git 仓库跟踪，需本地按需构建），再安装 Python 包；否则 `pip install -e .` 会报 `frontend/dist` 缺失。
 
 ```bash
-git clone https://github.com/shengjidaguai-china/BossHunter.git
-cd BossHunter
+git clone https://github.com/zhangyuge258/jobpilot.git
+cd jobpilot
 npm --prefix src/bosshunter/web/frontend ci
 npm --prefix src/bosshunter/web/frontend run build
 pip install -e .
@@ -36,13 +36,13 @@ pip install -e ".[pdf]"
 
 ### Windows 首次安装与桌面快捷方式
 
-1. 安装 Git、Python 3.10+、Node.js 22+ 和 Google Chrome。Python 安装时勾选 **Add python.exe to PATH**，安装完成后重新打开 PowerShell。
+1. 安装 Git、Python 3.10+、Node.js 20+ 和 Google Chrome。Python 安装时勾选 **Add python.exe to PATH**，安装完成后重新打开 PowerShell。
 2. 在准备存放项目的位置打开 PowerShell，确认 `git --version`、`py --version`、`node --version` 和 `npm.cmd --version` 均能运行。下面使用 `npm.cmd`，避免 PowerShell 将 `npm` 解析为受执行策略限制的 `npm.ps1`。
 3. 下载源码，在仓库自己的虚拟环境中安装。所有命令均在同一个 PowerShell 窗口依次执行：
 
 ```powershell
-git clone https://github.com/shengjidaguai-china/BossHunter.git
-cd BossHunter
+git clone https://github.com/zhangyuge258/jobpilot.git
+cd jobpilot
 py -m venv .venv
 npm.cmd --prefix src/bosshunter/web/frontend ci
 npm.cmd --prefix src/bosshunter/web/frontend run build

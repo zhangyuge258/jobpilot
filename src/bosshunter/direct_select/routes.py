@@ -98,6 +98,18 @@ def register_direct_select_routes(app: Bottle):
         except Exception as e:
             return _json_resp({"error": str(e)}, 500)
 
+    @app.route("/api/direct-select/campaigns/<campaign_id>/re-parse", method="POST")
+    def api_re_parse(campaign_id: str):
+        try:
+            payload = request.json or {}
+            supplemental = payload.get("supplemental_text", "")
+            updated = manager.re_parse_campaign(campaign_id, supplemental)
+            if not updated:
+                return _json_resp({"error": "Campaign not found"}, 404)
+            return _json_resp(updated)
+        except Exception as e:
+            return _json_resp({"error": str(e)}, 500)
+
     @app.route("/api/direct-select/jobs/<job_id>/status", method="POST")
     def api_update_job_status(job_id: str):
         try:

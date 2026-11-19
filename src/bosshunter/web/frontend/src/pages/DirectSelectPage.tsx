@@ -27,6 +27,8 @@ export default function DirectSelectPage() {
   const [isBatchModalOpen, setIsBatchModalOpen] = useState(false)
   const [isProfileDrawerOpen, setIsProfileDrawerOpen] = useState(false)
   const [reEvaluating, setReEvaluating] = useState(false)
+  const [reParsing, setReParsing] = useState(false)
+  const [supplementalText, setSupplementalText] = useState('')
 
   // 1. 获取画像
   const loadProfile = () => {
@@ -152,6 +154,26 @@ export default function DirectSelectPage() {
     }
   }
 
+  // 操作：重新提取/智能推演补充岗位
+  const handleReParse = async (customText?: string) => {
+    if (!activeId) return
+    setReParsing(true)
+    try {
+      await fetch(`/api/direct-select/campaigns/${activeId}/re-parse`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ supplemental_text: customText ?? supplementalText }),
+      })
+      await loadActiveCampaignDetail(activeId)
+      await loadCampaigns()
+      setSupplementalText('')
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setReParsing(false)
+    }
+  }
+
   // 岗位拆解：Top 10、剩余候选与排除池
   const eligibleJobs = activeCampaign?.jobs?.filter(j => !j.is_excluded) || []
   const excludedJobs = activeCampaign?.jobs?.filter(j => j.is_excluded) || []
@@ -258,6 +280,68 @@ export default function DirectSelectPage() {
               <p className="text-xs text-muted">
                 {activeCampaign.status_message || '后台多模态解析与多维打分中，你可以切换去投递其他已就绪企业'}
               </p>
+            </div>
+          ) : activeCampaign.total_jobs === 0 ? (
+            /* 0 岗专属补救与智能激活卡 */
+            <div className="rounded-2xl border border-border/80 bg-card p-8 space-y-6 max-w-2xl mx-auto mt-6">
+              <div className="flex items-start gap-4">
+                <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-amber-500/10 text-amber-500">
+                  <AlertCircle className="h-6 w-6" />
+                </div>
+                <div className="space-y-1">
+                  <h3 className="text-base font-bold text-foreground">
+                    未能自动提取到在招岗位（单页应用/动态渲染保护）
+                  </h3>
+                  <p className="text-xs text-muted leading-relaxed">
+                    该官网招聘系统多为前端动态单页应用 (SPA)、微信公众号专属通道或有防爬机制，静态请求无法读出职位。
+                  </p>
+                </div>
+              </div>
+
+              {/* 补救方案 1：AI 智能推导 */}
+              <div className="rounded-xl border border-primary/30 bg-primary/5 p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-bold text-primary flex items-center gap-1.5">
+                    <Sparkles className="h-4 w-4" />
+                    <span>方案一：基于该企业核心业务板块智能推演在招岗位（推荐）</span>
+                  </div>
+                </div>
+                <p className="text-xs text-muted">
+                  AI 将根据「{activeCampaign.company_name}」的真实业务线生成代表性对口在招岗位，并立即进行 Top 10 优选与画像对撞。
+                </p>
+                <Button
+                  size="sm"
+                  onClick={() => handleReParse()}
+                  disabled={reParsing}
+                  className="bg-primary text-white text-xs font-bold gap-1.5"
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>{reParsing ? '正在智能推演中...' : '立即智能推演生成岗位并排名'}</span>
+                </Button>
+              </div>
+
+              {/* 补救方案 2：直接粘贴文本/JD */}
+              <div className="rounded-xl border border-border/80 bg-secondary/30 p-4 space-y-3">
+                <div className="text-xs font-bold text-foreground">
+                  方案二：粘贴从招聘推文/页面复制的文字或 JD
+                </div>
+                <textarea
+                  rows={4}
+                  value={supplementalText}
+                  onChange={e => setSupplementalText(e.target.value)}
+                  placeholder="在此直接粘贴从微信推文、邮件或招聘页复制的岗位列表文字..."
+                  className="w-full rounded-xl border border-border/80 bg-card p-3 text-xs text-foreground placeholder:text-muted/60 focus:outline-hidden focus:ring-1 focus:ring-primary font-mono leading-relaxed resize-none"
+                />
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => handleReParse(supplementalText)}
+                  disabled={reParsing || !supplementalText.trim()}
+                  className="text-xs font-bold"
+                >
+                  <span>{reParsing ? '正在解析...' : '按粘贴文本提取并排名'}</span>
+                </Button>
+              </div>
             </div>
           ) : (
             <>

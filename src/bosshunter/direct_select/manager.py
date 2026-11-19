@@ -98,9 +98,14 @@ class DirectSelectManager:
             if source_type == "image":
                 raw_jobs = parse_from_image(campaign_id, source_input, media_type)
             elif source_type == "url":
-                raw_jobs = parse_from_url(campaign_id, source_input)
+                raw_jobs = parse_from_url(campaign_id, source_input, company_name=campaign.company_name, context=source_input)
             else:
                 raw_jobs = parse_from_text(campaign_id, source_input)
+
+            # 如果常规方式未获取到任何岗位（例如SPA单页、反爬或非标准格式），启动基于企业与业务线的智能推导
+            if not raw_jobs and campaign.company_name:
+                from bosshunter.direct_select.parser import infer_jobs_from_company
+                raw_jobs = infer_jobs_from_company(campaign_id, campaign.company_name, source_input)
 
             if not raw_jobs:
                 campaign.status = "ready"
@@ -173,6 +178,21 @@ class DirectSelectManager:
         campaign.excluded_jobs = excluded_count
         campaign.status_message = "已按最新画像重新计算排名"
         save_campaign(campaign)
+        return campaign
+
+    def re_parse_campaign(self, campaign_id: str, supplemental_text: str = "") -> Optional[CompanyCampaign]:
+        """重新解析该企业，支持传入补充的岗位文本或使用企业业务线推演."""
+        campaign = get_campaign(campaign_id)
+        if not campaign:
+            return None
+
+        source_input = supplemental_text if supplemental_text else campaign.source_input
+        source_type = "text" if supplemental_text else campaign.source_type
+        campaign.status = "queued"
+        campaign.status_message = "正在重新智能提取在招岗位..."
+        save_campaign(campaign)
+
+        self.executor.submit(self._run_campaign_task, campaign_id, source_type, source_input, "image/png")
         return campaign
 
 

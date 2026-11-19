@@ -107,31 +107,35 @@ export function BatchAddModal({ isOpen, onClose, onSuccess }: BatchAddModalProps
           return
         }
         for (const line of lines) {
-          // 匹配 URL 或公司名称
-          const isUrl = line.startsWith('http://') || line.startsWith('https://')
+          // 匹配 URL 与企业描述
+          const urlMatch = line.match(/(https?:\/\/[^\s]+)/i)
           let cname = '知名企业招聘'
           let sinput = line
+          let stype: 'url' | 'text' = 'text'
 
-          if (isUrl) {
-            try {
-              const urlObj = new URL(line)
-              cname = urlObj.hostname.replace('www.', '')
-            } catch {}
-          } else {
-            // 如果是一行：公司名 + 链接
-            const parts = line.split(/\s+/)
-            if (parts.length > 1 && parts[parts.length - 1].startsWith('http')) {
-              cname = parts.slice(0, parts.length - 1).join(' ')
-              sinput = parts[parts.length - 1]
+          if (urlMatch) {
+            stype = 'url'
+            const rawUrl = urlMatch[1]
+            const textWithoutUrl = line.replace(rawUrl, '').trim()
+            if (textWithoutUrl) {
+              const namePart = textWithoutUrl.split(/[-–—]/)[0].trim()
+              cname = namePart || textWithoutUrl.slice(0, 30)
+              sinput = `企业名称与业务方向：${textWithoutUrl}\n招聘官网链接：${rawUrl}`
             } else {
-              cname = line
-              sinput = line
+              try {
+                cname = new URL(rawUrl).hostname.replace('www.', '')
+              } catch {}
+              sinput = rawUrl
             }
+          } else {
+            cname = line.split(/[-–—]/)[0].trim() || line.slice(0, 30)
+            sinput = line
+            stype = 'text'
           }
 
           tasksToCreate.push({
             company_name: cname,
-            source_type: sinput.startsWith('http') ? 'url' : 'text',
+            source_type: stype,
             source_input: sinput,
           })
         }

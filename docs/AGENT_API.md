@@ -1,8 +1,8 @@
 # Local Agent Tool API
 
-BossHunter can be used as a local Agent tool instead of asking the user to
+JobPilot can be used as a local Agent tool instead of asking the user to
 operate the Web form or using Computer Use. The Agent interprets
-natural-language requests and calls the existing BossHunter workflow through a
+natural-language requests and calls the existing JobPilot workflow through a
 narrow, validated JSON contract over the local Dashboard server.
 
 Start the local server without opening a browser:
@@ -18,14 +18,14 @@ headers do not grant access. Do not expose these routes through a reverse proxy.
 
 ## Tool boundary
 
-The Agent is the workflow controller. BossHunter remains the execution engine:
+The Agent is the workflow controller. JobPilot remains the execution engine:
 it owns browser connection, collection, local job data, platform safety limits,
 and the existing human-confirmation gate before delivery.
 
 The API never returns or accepts an AI API Key. A local Agent can configure
-BossHunter, collect jobs, score candidates, draft greetings, and start
+JobPilot, collect jobs, score candidates, draft greetings, and start
 monitoring without one. If the Agent starts the existing `full` workflow,
-BossHunter still uses its own configured AI service for scoring and greeting
+JobPilot still uses its own configured AI service for scoring and greeting
 generation, just as it does from the Web interface.
 
 There is no direct "send now" Agent tool. The full workflow pauses before
@@ -40,7 +40,7 @@ curl -s http://127.0.0.1:8686/api/agent/tools
 
 ## Generic Onboarding
 
-Unlike a personal BOSS automation skill, BossHunter does not depend on a
+Unlike a personal BOSS automation skill, JobPilot does not depend on a
 user's existing BOSS search history, saved cities, or recommendation profile.
 For a new user, the Agent first asks the backend what information is missing:
 
@@ -100,7 +100,7 @@ Task starts also require explicit confirmation. The Agent API supports:
 | --- | --- | --- |
 | `collect` | Collects jobs with automatic scoring disabled | Not required |
 | `monitor` | Starts the existing monitoring loop | Not required to start |
-| `full` | Collects, scores, waits for human confirmation, then continues the existing workflow | Required by BossHunter |
+| `full` | Collects, scores, waits for human confirmation, then continues the existing workflow | Required by JobPilot |
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8686/api/agent/tasks \
@@ -180,7 +180,7 @@ their greeting. Agent greetings remain pending confirmation and are excluded
 from shared Web/CLI sender selection until a later human approval. Existing
 approval survives greeting preparation but does not authorize a later Agent
 re-evaluation. It writes other jobs to `filtered`. A passing greeting must be
-20-150 characters and contain no URL; BossHunter does not accept one for a
+20-150 characters and contain no URL; JobPilot does not accept one for a
 filtered job. The batch is rejected if a job is missing, deleted, or no longer
 `pending`, so an Agent cannot overwrite a user-reviewed or already-sent job.
 

@@ -1,6 +1,6 @@
 ---
-name: bosshunter
-description: 使用本地 BossHunter 采集招聘岗位、根据简历评分、准备招呼语、管理人工确认投递及跟进。用户要求使用 BossHunter 或操作其岗位池时使用。
+name: jobpilot
+description: 使用本地 JobPilot 采集招聘岗位、根据简历评分、准备招呼语、管理人工确认投递及跟进。用户要求使用 JobPilot 或操作其岗位池时使用。
 ---
 
 ## 本机安装
@@ -10,15 +10,15 @@ description: 使用本地 BossHunter 采集招聘岗位、根据简历评分、�
 - 本机 AI 请求使用独立变量 `BOSSHUNTER_AI_PROXY=http://127.0.0.1:7890`；Windows 桌面启动器已设置此变量。手动启动服务时也须为进程设置它。浏览器和 localhost 请求保持原有连接方式。
 - 日常操作优先按下方本机 Agent API 模式执行；安装或了解项目本身不代表授权采集、发送、监听或上传简历。
 
-# BossHunter Skill
+# JobPilot Skill
 
-某直聘智能求职 Agent — 全自动化求职流水线的 Claude Code Skill。
+JobPilot 智能求职副驾 Agent — 全流程自动化多平台求职系统。
 
 ## 本机 Agent 后端模式（优先）
 
-当用户希望用自然语言而不是填写 Web 表单使用 BossHunter 时，本节优先于下方的
-旧版 CLI / Web 引导。把 BossHunter 当成后端执行工具：Agent 收集偏好、修改受控配置、
-启动采集、评分并准备候选；BossHunter 负责 Chrome CDP、数据库、频率限制和投递风控。
+当用户希望用自然语言而不是填写 Web 表单使用 JobPilot 时，本节优先于下方的
+旧版 CLI / Web 引导。把 JobPilot 当成后端执行工具：Agent 收集偏好、修改受控配置、
+启动采集、评分并准备候选；JobPilot 负责 Chrome CDP、数据库、频率限制和投递风控。
 
 1. 确保本地服务运行在 `127.0.0.1:8686`，先读
    [`docs/AGENT_API.md`](docs/AGENT_API.md) 和 `GET /api/agent/onboarding`。

@@ -1,4 +1,4 @@
-# BossHunter CLI 命令
+# JobPilot CLI 命令
 
 ## 常用命令
 
