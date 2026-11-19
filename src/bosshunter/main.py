@@ -1,4 +1,4 @@
-"""BossHunter CLI - 主入口"""
+"""JobPilot CLI - 主入口"""
 
 import os
 from pathlib import Path
@@ -10,7 +10,7 @@ from bosshunter import __version__
 from bosshunter.config import load_config, migrate_legacy_credentials
 
 console = Console()
-GITHUB_URL = "https://github.com/powerycy/BossHunter"
+GITHUB_URL = "https://github.com/zhangyuge258/jobpilot"
 
 
 def _hint_web():

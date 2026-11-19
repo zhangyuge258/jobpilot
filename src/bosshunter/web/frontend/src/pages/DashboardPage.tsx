@@ -417,7 +417,7 @@ function GettingStartedCard({
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-card-border pt-3">
         <p className="max-w-xl text-xs leading-5 text-muted">单独采集且关闭自动评分时，可先跳过简历和 AI 设置；运行全流程前请完成全部准备。</p>
         <div className="flex flex-wrap items-center gap-3">
-          <a data-tour="chrome-guide" className="text-xs font-semibold text-primary underline-offset-2 hover:underline" href="https://github.com/shengjidaguai-china/BossHunter/blob/main/docs/QUICKSTART.md#3-开启-chrome-远程调试" target="_blank" rel="noreferrer">连接 Chrome 说明 ↗</a>
+          <a data-tour="chrome-guide" className="text-xs font-semibold text-primary underline-offset-2 hover:underline" href="https://github.com/zhangyuge258/jobpilot/blob/main/docs/QUICKSTART.md#3-开启-chrome-远程调试" target="_blank" rel="noreferrer">连接 Chrome 说明 ↗</a>
           <Button data-tour="check-preflight" variant="secondary" size="sm" onClick={onCheck} disabled={checking}>
             <ShieldCheck className="mr-1.5 h-3.5 w-3.5" />
             {checking ? '检查中' : '检查准备情况'}

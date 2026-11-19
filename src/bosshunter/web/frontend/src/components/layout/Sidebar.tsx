@@ -12,7 +12,7 @@ const navItems = [
   { to: '/config', icon: Settings, label: '偏好' },
 ]
 
-const GITHUB_URL = 'https://github.com/powerycy/BossHunter'
+const GITHUB_URL = 'https://github.com/zhangyuge258/jobpilot'
 
 interface SidebarProps {
   pendingReplies?: number
@@ -107,7 +107,7 @@ export function Sidebar({ pendingReplies: pendingRepliesProp }: SidebarProps) {
           href={GITHUB_URL}
           target="_blank"
           rel="noreferrer"
-          aria-label="BossHunter GitHub"
+          aria-label="JobPilot GitHub"
           className="relative flex items-center justify-center rounded-xl border border-border/80 bg-secondary/40 px-3 py-2.5 text-xs font-semibold text-foreground transition-all hover:bg-secondary hover:text-primary md:rounded-xl"
         >
           <Github className="h-4 w-4 shrink-0 md:absolute md:left-3" />
